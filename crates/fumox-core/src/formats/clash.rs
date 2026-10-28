@@ -10,7 +10,7 @@
 //! `ws-opts`/`grpc-opts`/`h2-opts`/`http-opts` blocks mihomo actually reads.
 //! URI parameters travel under their native keys (`type` for the network of
 //! vless/trojan, `net` for vmess), while Clash-input entries already carry
-//! the mihomo keys (`network`, `ws-path`, structured YAML opts) — both
+//! the mihomo keys (`network`, `ws-path`, structured YAML opts), both
 //! spellings are accepted everywhere.
 //!
 //! This is also the mapping used by the probe's T2 generator, which only
@@ -30,6 +30,8 @@ pub fn is_supported(scheme: Scheme) -> bool {
             | Scheme::Ss
             | Scheme::Hysteria2
             | Scheme::Socks5
+            | Scheme::Snell
+            | Scheme::AnyTls
     )
 }
 
@@ -146,6 +148,59 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
                 put("tls", Value::Bool(true));
             }
         }
+        Scheme::Snell => {
+            put("type", Value::String("snell".into()));
+            // meow-rs names the secret `psk`; the URI keeps it as the
+            // userinfo, so the credential maps straight across.
+            put("psk", Value::String(entry.credential.clone()));
+            // Omitted entirely when the feed does not say: meow's own
+            // default is v4, and writing an explicit default here would
+            // pin every entry to a value the operator never chose.
+            if let Some(version) = super::param_value(entry, "version") {
+                put("version", Value::String(version.to_string()));
+            }
+            // Only emitted when asked, so a false cannot become "true"
+            // through a string round-trip. `udp` comes from the shared
+            // tail below, which also covers the Clash-input case.
+            if super::param_truthy(entry, "reuse") {
+                put("reuse", Value::Bool(true));
+            }
+            // Both keys pass through verbatim, including the combinations
+            // meow rejects (obfs-opts on v6, mode on older). It drops those
+            // items rather than failing the config, so the T2 check 404s and
+            // charges the proxy, which is the honest verdict.
+            if let Some(mode) = super::param_value(entry, "mode") {
+                put("mode", Value::String(mode.to_string()));
+            }
+            // A Clash feed keeps the nested `obfs-opts` block, a URI feed the
+            // flat `obfs` / `obfs-host` pair. The flat form wins, as in put_ws_opts.
+            let obfs_yaml = super::param_map(entry, "obfs-opts");
+            let obfs =
+                super::param_value(entry, "obfs").or_else(|| super::map_str(&obfs_yaml, "mode"));
+            let obfs_host = super::param_value(entry, "obfs-host")
+                .or_else(|| super::map_str(&obfs_yaml, "host"));
+            if obfs.is_some() || obfs_host.is_some() {
+                let mut opts = Mapping::new();
+                // meow treats an absent obfs as off, and so do we: only a
+                // host without a mode would be ambiguous.
+                opts.insert(
+                    Value::String("mode".into()),
+                    Value::String(obfs.clone().unwrap_or_else(|| "off".to_string())),
+                );
+                if let Some(host) = obfs_host {
+                    opts.insert(Value::String("host".into()), Value::String(host));
+                }
+                put("obfs-opts", Value::Mapping(opts));
+            }
+        }
+        Scheme::AnyTls => {
+            put("type", Value::String("anytls".into()));
+            put("password", Value::String(entry.credential.clone()));
+            // meow's anytls parser reads `sni` only; it has no
+            // client-fingerprint knob, so `fp` is deliberately not mapped.
+            copy_param(entry, "sni", "sni", &mut put);
+            // skip-cert-verify and udp come from the shared tail below.
+        }
         Scheme::Naive | Scheme::Tuic | Scheme::Mieru => return None,
     }
 
@@ -167,7 +222,7 @@ fn security_is(entry: &ProxyEntry, want: &str) -> bool {
 
 /// `reality-opts: {public-key, short-id}` from URI `pbk`/`sid` params or a
 /// Clash-input `reality-opts` block. Emitted only when at least one key is
-/// present — an empty block would make mihomo reject the proxy.
+/// present, an empty block would make mihomo reject the proxy.
 fn put_reality_opts(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
     let pbk = super::reality_public_key(entry);
     let sid = super::reality_short_id(entry);
@@ -489,7 +544,7 @@ fn yaml_list(map: &Option<Mapping>, key: &str) -> Option<Vec<String>> {
 }
 
 /// Encode the final candidate list as a Clash YAML document. Duplicate
-/// names are suffixed « (2)», « (3)»… (PLAN gap 14).
+/// names are suffixed « (2)», « (3)»…
 pub fn encode_clash(entries: &[ProxyEntry]) -> String {
     let supported: Vec<&ProxyEntry> = entries.iter().filter(|e| is_supported(e.scheme)).collect();
     let names = super::dedupe_names(supported.iter().map(|e| e.name.as_str()));
@@ -610,7 +665,7 @@ mod tests {
             ws.get(Value::from("path")).and_then(Value::as_str),
             Some("/ws")
         );
-        // No insecure toggle on the entry — no skip-cert-verify.
+        // No insecure toggle on the entry, no skip-cert-verify.
         assert!(field(&v, "skip-cert-verify").is_none());
     }
 
@@ -916,6 +971,57 @@ mod tests {
         assert!(entry_to_clash(&entry(Scheme::Tuic, "c", &[])).is_none());
         assert!(entry_to_clash(&entry(Scheme::Mieru, "c", &[])).is_none());
         assert!(entry_to_clash(&entry(Scheme::Naive, "c", &[])).is_none());
+        // snell/anytls have mapping arms and are meow-tunnelable; a
+        // regression here silently strips them from Clash subscriptions.
+        assert!(entry_to_clash(&entry(Scheme::Snell, "c", &[])).is_some());
+        assert!(entry_to_clash(&entry(Scheme::AnyTls, "c", &[])).is_some());
+    }
+
+    #[test]
+    fn snell_and_anytls_are_supported_and_rendered() {
+        assert!(is_supported(Scheme::Snell));
+        assert!(is_supported(Scheme::AnyTls));
+
+        let snell = entry(
+            Scheme::Snell,
+            "psk-1",
+            &[
+                ("version", "4"),
+                ("obfs", "http"),
+                ("obfs-host", "o.example.com"),
+            ],
+        );
+        let v = entry_to_clash(&snell).unwrap();
+        assert_eq!(str_field(&v, "type"), Some("snell"));
+        assert_eq!(str_field(&v, "psk"), Some("psk-1"));
+        assert_eq!(str_field(&v, "version"), Some("4"));
+        let obfs = field(&v, "obfs-opts").unwrap().as_mapping().unwrap();
+        assert_eq!(
+            obfs.get(Value::from("mode")).and_then(Value::as_str),
+            Some("http")
+        );
+        assert_eq!(
+            obfs.get(Value::from("host")).and_then(Value::as_str),
+            Some("o.example.com")
+        );
+
+        let anytls = entry(
+            Scheme::AnyTls,
+            "pw-1",
+            &[("sni", "a.example.com"), ("skip-cert-verify", "true")],
+        );
+        let v = entry_to_clash(&anytls).unwrap();
+        assert_eq!(str_field(&v, "type"), Some("anytls"));
+        assert_eq!(str_field(&v, "password"), Some("pw-1"));
+        assert_eq!(str_field(&v, "sni"), Some("a.example.com"));
+        assert_eq!(
+            field(&v, "skip-cert-verify").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // The end-to-end dispatch must not filter them out either.
+        let yaml = encode_clash(&[entry(Scheme::Snell, "psk-2", &[])]);
+        assert!(yaml.contains("type: snell"), "yaml was: {yaml}");
     }
 
     #[test]

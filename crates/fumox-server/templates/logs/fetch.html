@@ -49,7 +49,7 @@
             <th>{{ self.t("common.time") }}</th>
             <th>{{ self.t("common.source") }}</th>
             <th>{{ self.t("common.result") }}</th>
-            <th>HTTP</th>
+            <th>{{ self.t("common.http") }}</th>
             <th class="col-optional">{{ self.t("common.size") }}</th>
             <th>{{ self.t("nav.proxies") }}</th>
             <th>{{ self.t("common.error") }}</th>
@@ -58,7 +58,7 @@
         <tbody>
           {% for row in rows %}
           <tr>
-            <td class="small muted">{{ self.ts(row.fetched_at) | safe }}</td>
+            <td class="small muted">{{ self.ts(row.fetched_at) | safe }}{% match row.duration_ms %}{% when Some with (ms) %} · {{ ms }} {{ self.t("common.ms") }}{% when None %}{% endmatch %}</td>
             <td>
               {% match row.source_name %}
                 {% when Some with (name) %}<a class="cell-link" href="/admin/sources/{{ row.source_id }}">{{ name }}</a>
@@ -101,19 +101,8 @@
       </table>
     </div>
 
-    {% if pages.len() > 1 %}
-      <div class="pagination">
-        {% for (p, current) in pages %}
-          {% if *p == 0 %}
-            <span class="page gap">…</span>
-          {% else if current %}
-            <span class="page current">{{ p }}</span>
-          {% else %}
-            <a class="page" href="/admin/logs/fetch?page={{ p }}&amp;per_page={{ per_page }}{{ self.query_suffix() }}">{{ p }}</a>
-          {% endif %}
-        {% endfor %}
-      </div>
-    {% endif %}
+    {% let page_base = "/admin/logs/fetch" %}
+    {% include "_pagination.html" %}
   {% endif %}
 </div>
 {% endblock %}

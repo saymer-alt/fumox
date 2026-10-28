@@ -1,6 +1,8 @@
-//! Admin screen handlers. Read queries specific to the admin UI live here
-//! (joins and aggregates the typed repository layer doesn't model); shared
-//! mutations go through `fumox_core::repo`.
+//! Admin screen handlers. The list screens and card reads go through the
+//! typed `fumox_core::repo` layer (their dynamic filters live there, in
+//! one place); the dashboard's cross-table aggregates are the remaining
+//! read queries specific to the admin UI, and shared mutations go through
+//! `fumox_core::repo`.
 
 mod import_export;
 mod logs;
@@ -22,13 +24,15 @@ pub use sources::*;
 
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
+use crate::admin::pipeline_editor::BuilderState;
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
+use crate::pipeline::CompiledPipeline;
+use crate::security::fmt_rfc3339_utc;
 use askama::Template;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use fumox_core::models::Scheme;
 
 use crate::admin::dash_top_n::{self, DashTopN};
 
@@ -54,6 +58,10 @@ struct DashboardTemplate {
     proxy_counts: Vec<(String, i64)>,
     fetch_total_24h: i64,
     fetch_ok_24h: i64,
+    /// Age in seconds of the last scheduler sweep start (stamped into
+    /// `meta.server_cycle` in `scheduler::sweep`), rendered as a sub-line
+    /// of the fetches card. `None` until the first sweep ever ran.
+    server_cycle_age_secs: Option<i64>,
     recent_errors: Vec<SourceErrorRow>,
     /// Per-source health counters (the former stats screen table).
     sources: Vec<SourceStatRow>,
@@ -77,7 +85,7 @@ struct DashboardTemplate {
     ingest_days: Vec<(i64, i64)>,
     /// Largest per-day value of `ingest_days` (bar scale).
     ingest_max: i64,
-    /// Configurable Top-N from the `fumox_dash_top_n` cookie — drives the
+    /// Configurable Top-N from the `fumox_dash_top_n` cookie, drives the
     /// `recent_errors`, `top_alive`, `top_failures` widgets and the country
     /// split's display cap.
     top_n: DashTopN,
@@ -102,18 +110,14 @@ struct SourceStatRow {
     id: String,
     name: String,
     enabled: i64,
+    unknown: i64,
     alive: i64,
     ready: i64,
     quarantine: i64,
-    unknown: i64,
     removed: i64,
     total: i64,
-    /// Oldest `created_at` among this source's alive proxies.
-    oldest_alive_at: Option<i64>,
-    /// Distinct protocol schemes this source has ever yielded.
-    schemes: i64,
-    /// Number of countries among this source's alive proxies.
-    countries: i64,
+    /// Oldest `created_at` among this source's ready proxies.
+    oldest_ready_at: Option<i64>,
 }
 
 /// One row of the "longest-living alive proxies" top.
@@ -164,13 +168,18 @@ struct IngestDayRow {
 }
 
 // Formatting helpers exposed to the dashboard template. askama passes
-// call arguments by reference, so every helper takes &T.
+// call arguments by reference, so every helper takes &T. The timestamp
+// helpers (`ts`, `opt_ts`) come from `impl_i18n!`.
 impl DashboardTemplate {
-    fn ts(&self, ts: &i64) -> String {
-        fmt_ts_element(*ts)
+    /// Calendar day of an ingest-chart bucket, date only (the chart's
+    /// columns are midnight UTC and a timestamp does not fit them).
+    fn day(&self, ts: &i64) -> String {
+        fmt_day_element(*ts)
     }
-    fn opt_ts(&self, ts: &Option<i64>) -> String {
-        fmt_opt_ts_element(*ts)
+    /// The same day as plain text, for the `aria-label` of a chart column
+    /// (an attribute must not carry the `<time>` element).
+    fn day_plain(&self, ts: &i64) -> String {
+        fmt_day_plain(*ts)
     }
     fn proxy_total(&self) -> i64 {
         self.proxy_counts.iter().map(|(_, count)| count).sum()
@@ -263,15 +272,13 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
     // Per-source health counters (single aggregate over the join table).
     let sources: Vec<SourceStatRow> = match sqlx::query_as(
         "SELECT s.id, s.name, s.enabled,
+                COALESCE(SUM(p.status = 'unknown'), 0)   AS unknown,
                 COALESCE(SUM(p.status = 'alive'), 0)     AS alive,
                 COALESCE(SUM(p.status = 'ready'), 0)     AS ready,
                 COALESCE(SUM(p.status = 'quarantine'), 0) AS quarantine,
-                COALESCE(SUM(p.status = 'unknown'), 0)   AS unknown,
                 COALESCE(SUM(p.status = 'removed'), 0)    AS removed,
                 COUNT(DISTINCT p.id)                      AS total,
-                MIN(CASE WHEN p.status = 'alive' THEN p.created_at END) AS oldest_alive_at,
-                COUNT(DISTINCT p.scheme)                  AS schemes,
-                COUNT(DISTINCT CASE WHEN p.status = 'alive' THEN p.geo_country END) AS countries
+                MIN(CASE WHEN p.status = 'ready' THEN p.created_at END) AS oldest_ready_at
          FROM sources s
          LEFT JOIN proxy_source_links l ON l.source_id = s.id
          LEFT JOIN proxies p ON p.id = l.proxy_id
@@ -285,7 +292,7 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         Err(err) => return server_error(lang, &err),
     };
 
-    // Longest-living ready proxies: oldest `created_at` first — the
+    // Longest-living ready proxies: oldest `created_at` first, the
     // tunnel-verified tier (`ready`) is a strict subset of `alive`, set
     // only by a successful T2, so showing the top-N there surfaces the
     // proxies that have stayed end-to-end working the longest.
@@ -377,7 +384,7 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
             Err(err) => return server_error(lang, &err),
         };
 
-    // Top failure reasons over the rolling 24h window — the operator's
+    // Top failure reasons over the rolling 24h window, the operator's
     // most actionable signal after the source-errors block at the top:
     // "what kind of probe failure is happening most often right now?"
     let top_failures: Vec<(String, i64)> =
@@ -387,22 +394,9 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         };
 
     // Unprobeable schemes (tuic/mieru stay `unknown` forever).
-    let unprobeable_schemes: Vec<&'static str> = Scheme::all()
-        .iter()
-        .filter(|scheme| !scheme.is_probeable())
-        .map(|scheme| scheme.as_str())
-        .collect();
-    let placeholders = vec!["?"; unprobeable_schemes.len()].join(", ");
-    let unprobeable_sql = format!("SELECT COUNT(*) FROM proxies WHERE scheme IN ({placeholders})");
-    let unprobeable = {
-        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(unprobeable_sql.as_str()));
-        for scheme in &unprobeable_schemes {
-            query = query.bind(scheme);
-        }
-        match query.fetch_one(pool).await {
-            Ok(count) => count,
-            Err(err) => return server_error(lang, &err),
-        }
+    let unprobeable = match fumox_core::repo::proxies::count_unprobeable(pool).await {
+        Ok(count) => count,
+        Err(err) => return server_error(lang, &err),
     };
 
     // Ingest dynamics: proxies created per day over the last 7 days,
@@ -437,6 +431,18 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         .max()
         .unwrap_or(0);
 
+    // Age of the scheduler's last sweep (the stamp is written at sweep
+    // start, so a hung sweep shows as aging). A negative clock skew clamps
+    // to zero rather than rendering "-3 s".
+    let server_cycle_age_secs =
+        match fumox_core::repo::meta_get(pool, fumox_core::repo::probe::meta::SERVER_CYCLE_KEY)
+            .await
+        {
+            Ok(Some(raw)) => raw.parse::<i64>().ok().map(|ts| (now - ts).max(0)),
+            Ok(None) => None,
+            Err(err) => return server_error(lang, &err),
+        };
+
     render_html(
         lang.clone(),
         &DashboardTemplate {
@@ -452,6 +458,7 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
             proxy_counts,
             fetch_total_24h,
             fetch_ok_24h,
+            server_cycle_age_secs,
             recent_errors,
             sources,
             top_alive,
@@ -522,10 +529,6 @@ async fn country_split(
     .await?)
 }
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
 /// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (the no-JS
 /// fallback). This text is the no-JS fallback inside [`fmt_ts_element`].
 pub fn fmt_ts(ts: i64) -> String {
@@ -537,36 +540,53 @@ pub fn fmt_ts(ts: i64) -> String {
     }
 }
 
-/// RFC 3339 UTC form for the `datetime` attribute of a `<time>` element.
-fn fmt_ts_attr(ts: i64) -> String {
-    const FMT: &[time::format_description::FormatItem<'static>] =
-        time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-    match time::OffsetDateTime::from_unix_timestamp(ts) {
-        Ok(dt) => dt.format(FMT).unwrap_or_else(|_| ts.to_string()),
-        Err(_) => ts.to_string(),
-    }
-}
-
 /// Render a Unix timestamp as a `<time class="ts">` element: the
 /// `datetime` attribute carries the UTC instant in
 /// RFC 3339 form, the text keeps the UTC `YYYY-MM-DD HH:MM:SS` fallback. The
 /// admin JS (base.html) rewrites the text into the user's timezone and
 /// re-runs after every HTMX swap; without JS the UTC text stays readable.
-/// The output is HTML — templates must render it through askama's `| safe`.
+/// The output is HTML, templates must render it through askama's `| safe`.
 /// Only server-generated digits and punctuation are interpolated, so it is
 /// safe to trust.
 pub fn fmt_ts_element(ts: i64) -> String {
     format!(
         "<time class=\"ts\" datetime=\"{}\">{}</time>",
-        fmt_ts_attr(ts),
+        fmt_rfc3339_utc(ts),
         fmt_ts(ts)
     )
 }
 
-/// [`fmt_ts_element`] for optional timestamps; `None` renders the em dash
+/// [`fmt_ts_element`] for optional timestamps; `None` renders the en dash
 /// used across the admin tables (plain text, no element).
 pub fn fmt_opt_ts_element(ts: Option<i64>) -> String {
-    ts.map(fmt_ts_element).unwrap_or_else(|| "—".into())
+    ts.map(fmt_ts_element).unwrap_or_else(|| "–".into())
+}
+
+/// Render a Unix timestamp as a `<time class="ts day">` element carrying the
+/// calendar **day** only, for the per-day buckets of the ingest chart.
+///
+/// A bucket is midnight UTC, so a timestamp formatter is the wrong shape
+/// here: it spends the label's width on `00:00:00`, which the 64 px column
+/// then clips. The `day` class tells `localize()` in `base.html` to format
+/// the date without a time part, so the label survives the rewrite and the
+/// tooltip still carries the full instant.
+pub fn fmt_day_element(ts: i64) -> String {
+    format!(
+        "<time class=\"ts day\" datetime=\"{}\">{}</time>",
+        fmt_rfc3339_utc(ts),
+        fmt_day_plain(ts)
+    )
+}
+
+/// The `YYYY-MM-DD` calendar day of a timestamp, as plain text (no markup,
+/// for attribute values).
+fn fmt_day_plain(ts: i64) -> String {
+    const FMT: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[year]-[month]-[day]");
+    match time::OffsetDateTime::from_unix_timestamp(ts) {
+        Ok(dt) => dt.format(FMT).unwrap_or_else(|_| ts.to_string()),
+        Err(_) => ts.to_string(),
+    }
 }
 
 /// Human-readable byte size for fetch logs (units follow the UI language).
@@ -634,7 +654,7 @@ pub fn not_found(lang: Lang, what_key: &str) -> Response {
 
 /// Percent-encode a string into unreserved ASCII so it can travel inside a
 /// response header. Header bytes are decoded by the browser as Latin-1
-/// (isomorphic decode), so raw UTF-8 — e.g. a Russian toast message — would
+/// (isomorphic decode), so raw UTF-8, e.g. a Russian toast message, would
 /// arrive as mojibake; percent-encoded UTF-8 survives the wire intact and is
 /// restored client-side with `decodeURIComponent`.
 pub(super) fn header_safe(value: &str) -> String {
@@ -689,18 +709,41 @@ fn action_response_with_level(
             fragment_html,
         )
             .into_response();
-        let payload = format!(
-            "{{\"toast\": {{\"message\": \"{}\", \"level\": \"{level}\"}}}}",
-            header_safe(toast)
-        );
-        response.headers_mut().insert(
-            "HX-Trigger",
-            HeaderValue::from_str(&payload).expect("header_safe output is visible ASCII"),
-        );
+        response
+            .headers_mut()
+            .insert("HX-Trigger", toast_trigger(level, toast));
         response
     } else {
-        Redirect::to(redirect_to).into_response()
+        // Plain-browser path: an HTMX-only toast would be lost here, so
+        // the message rides back on the redirect URL and the layout shows
+        // it once on load (see base.html).
+        flash_redirect(redirect_to, toast, level)
     }
+}
+
+/// Redirect carrying one toast for the plain-browser path, as `flash` /
+/// `flash_level` query parameters (percent-encoded via [`header_safe`]).
+/// The layout consumes and strips them on load, so a refresh or a shared
+/// URL does not replay a stale toast.
+pub(super) fn flash_redirect(redirect_to: &str, toast: &str, level: &str) -> Response {
+    let separator = if redirect_to.contains('?') { '&' } else { '?' };
+    Redirect::to(&format!(
+        "{redirect_to}{separator}flash={}&flash_level={level}",
+        header_safe(toast)
+    ))
+    .into_response()
+}
+
+/// `HX-Trigger` value for one toast. The message is percent-encoded for
+/// the same reason as [`header_safe`] (header bytes are Latin-1 on the
+/// wire, raw UTF-8 would mojibake) and because a raw `"` in the message
+/// would break the JSON envelope.
+pub(super) fn toast_trigger(level: &str, message: &str) -> HeaderValue {
+    let payload = format!(
+        "{{\"toast\": {{\"message\": \"{}\", \"level\": \"{level}\"}}}}",
+        header_safe(message)
+    );
+    HeaderValue::from_str(&payload).expect("header_safe output is visible ASCII")
 }
 
 fn is_htmx(headers: &HeaderMap) -> bool {
@@ -714,7 +757,7 @@ pub type FormMap = std::collections::HashMap<String, String>;
 /// Query parameters that keep duplicates and their original order.
 ///
 /// [`FormMap`] is a `HashMap`, so a repeating key silently collapses to the
-/// last value — which broke the proxy list's multi-select status filter
+/// last value, which broke the proxy list's multi-select status filter
 /// (`?status=alive&status=quarantine` filtered on one status only; security
 /// audit, 2026-09-05). Screens with a multi-select filter extract this.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -741,7 +784,7 @@ pub const MAX_PAGE_SIZE: i64 = 200;
 /// Field/count caps for admin-stored input. A single POST is bounded by
 /// the CSRF buffer (1 MiB) and the
 /// router-wide `DefaultBodyLimit`; these caps keep what actually reaches
-/// SQLite — and every later re-render of it — proportionate to what the
+/// SQLite, and every later re-render of it, proportionate to what the
 /// forms legitimately hold.
 pub mod caps {
     /// Source/profile URL length (matches the fetcher's `MAX_URL_LEN`).
@@ -769,6 +812,166 @@ pub mod caps {
     /// URLs DNS-vetted per import request; the rest are re-vetted at fetch
     /// time (the fetch path re-vets every request anyway).
     pub const IMPORT_DNS_VET: usize = 25;
+}
+
+/// Slug rules shared by the source and profile forms and the import
+/// validation: starts alphanumeric, then `[A-Za-z0-9_-]`, total length
+/// 2–64. Compiled once; the form paths used to rebuild it on every
+/// validation call.
+static SLUG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$").expect("valid slug regex")
+});
+
+/// The id of a repo row: what the shared slug-uniqueness check compares
+/// against the row being edited. Both slug tables (`sources`, `profiles`)
+/// key their rows by a string id.
+trait RowId {
+    fn row_id(&self) -> &str;
+}
+
+impl RowId for fumox_core::models::Source {
+    fn row_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl RowId for fumox_core::models::Profile {
+    fn row_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Validate the optional `slug` field shared by the source and profile
+/// forms: format rules ([`SLUG_RE`]), then uniqueness. `lookup` resolves
+/// the row of one slug table already holding the value; the future is
+/// built eagerly but only awaited after the format check passes, and a DB
+/// error counts as "free" (a slug that sneaks through still fails the
+/// table's UNIQUE constraint at save time, as before). A row that is not
+/// `existing_id` (the row being edited) means the slug is taken. Empty
+/// input yields `None`; problems are pushed as `slug`-field errors.
+async fn validate_slug<T, F>(
+    slug_raw: &str,
+    existing_id: Option<&str>,
+    lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+    lookup: F,
+) -> Option<String>
+where
+    F: std::future::Future<Output = fumox_core::Result<Option<T>>>,
+    T: RowId,
+{
+    if slug_raw.is_empty() {
+        return None;
+    }
+    if !SLUG_RE.is_match(slug_raw) {
+        errors.push(("slug".into(), lang.t("val.slug_format").into()));
+        return Some(slug_raw.to_string());
+    }
+    if let Ok(Some(other)) = lookup.await
+        && other.row_id() != existing_id.unwrap_or_default()
+    {
+        errors.push(("slug".into(), lang.t("val.slug_taken").into()));
+    }
+    Some(slug_raw.to_string())
+}
+
+/// Compact size of a pipeline document, the measure both form builders
+/// apply to the *generated* JSON and the import path to every stored
+/// document: the stored JSON is re-rendered into every edit form and
+/// recompiled by the preview, so a form or a file could otherwise plant a
+/// pipeline up to the 1 MiB body limit (16× the form cap).
+///
+/// The raw form mode measures the *pretty* JSON it renders into its
+/// textarea instead, so a document in the window between the two sizes is
+/// accepted by the import here and then rejected by the form on every
+/// later save. The builder mode is the one this measure mirrors exactly.
+fn pipeline_size(pipeline: &serde_json::Value) -> usize {
+    serde_json::to_string(pipeline).map_or(usize::MAX, |text| text.len())
+}
+
+/// Validate + build the stored pipeline value from the shared pipeline
+/// widget fields (`pipeline_mode`, the widget rows, the raw `pipeline`
+/// textarea) of the source and profile forms. In builder mode the JSON is
+/// generated from the widget fields server-side (a stale `pipeline`
+/// textarea, if any, is ignored); in raw mode the textarea is the input,
+/// as before. Problems are pushed onto `errors` as `pipeline`-field
+/// messages; `None` means no stored pipeline (or one that failed
+/// validation).
+fn pipeline_from_form(
+    form: &[(String, String)],
+    lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+) -> Option<serde_json::Value> {
+    let get = |key: &str| -> String {
+        form.iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    if get("pipeline_mode") == "builder" {
+        let generated = BuilderState::from_form(form).emit();
+        match generated {
+            None => None,
+            Some(value) => match CompiledPipeline::from_json(Some(&value)) {
+                Ok(_) => {
+                    // Same cap as raw mode: the generated JSON is stored
+                    // verbatim and re-rendered into every edit form, so a
+                    // form with thousands of widget rows must not exceed
+                    // the budget either.
+                    if pipeline_size(&value) > caps::PIPELINE_BYTES {
+                        errors.push((
+                            "pipeline".into(),
+                            lang.t("val.field_too_long")
+                                .replace("{}", &caps::PIPELINE_BYTES.to_string()),
+                        ));
+                        None
+                    } else {
+                        Some(value)
+                    }
+                }
+                Err(issues) => {
+                    for issue in issues {
+                        errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
+                    }
+                    None
+                }
+            },
+        }
+    } else {
+        let pipeline_raw = get("pipeline");
+        if pipeline_raw.trim().is_empty() {
+            None
+        } else if pipeline_raw.len() > caps::PIPELINE_BYTES {
+            // Pipeline cap: the JSON is stored verbatim and re-rendered
+            // into every edit form.
+            errors.push((
+                "pipeline".into(),
+                lang.t("val.field_too_long")
+                    .replace("{}", &caps::PIPELINE_BYTES.to_string()),
+            ));
+            None
+        } else {
+            match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {
+                Ok(value) => match CompiledPipeline::from_json(Some(&value)) {
+                    Ok(_) => Some(value),
+                    Err(issues) => {
+                        for issue in issues {
+                            errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
+                        }
+                        None
+                    }
+                },
+                Err(err) => {
+                    errors.push((
+                        "pipeline".into(),
+                        lang.t("val.invalid_json").replace("{}", &err.to_string()),
+                    ));
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// Clamp a requested page size into the allowed range.
@@ -847,6 +1050,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn day_element_omits_the_time_part() {
+        // A midnight-UTC ingest bucket must label its column with the date
+        // alone: the `day` class keeps base.html's localize() from writing a
+        // time back in, and a 64 px column has no room for one.
+        let html = fmt_day_element(1_700_000_000);
+        assert_eq!(
+            html,
+            "<time class=\"ts day\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14</time>"
+        );
+        assert!(!html.contains("22:13:20</time>"), "the label kept a time");
+    }
+
+    #[test]
     fn fmt_ts_element_carries_utc_datetime_and_fallback_text() {
         // 1_700_000_000 == 2023-11-14 22:13:20 UTC.
         let html = fmt_ts_element(1_700_000_000);
@@ -855,7 +1071,7 @@ mod tests {
             "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
         );
 
-        assert_eq!(fmt_opt_ts_element(None), "—");
+        assert_eq!(fmt_opt_ts_element(None), "–");
         assert_eq!(
             fmt_opt_ts_element(Some(1_700_000_000)),
             "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
@@ -872,7 +1088,7 @@ mod tests {
     fn toast_header_is_ascii_and_decodes_to_the_message() {
         // Russian text (raw UTF-8 would mojibake in a Latin-1 header) plus
         // JSON-breaking characters.
-        let message = "источник включён — \"quote\" \\ backslash";
+        let message = "источник включён, \"quote\" \\ backslash";
         let response = action_response(true, "/admin/sources/x", String::new(), message);
 
         let header = response
@@ -909,6 +1125,35 @@ mod tests {
         let response = action_response(false, "/admin/sources", String::new(), "готово");
         assert!(response.headers().get("HX-Trigger").is_none());
         assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+        // The toast rides on the Location as a query parameter instead;
+        // percent-encoded so the wire stays ASCII.
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("plain path must redirect")
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("/admin/sources?flash="), "{location}");
+        assert!(location.ends_with("&flash_level=ok"), "{location}");
+        assert!(location.is_ascii(), "{location}");
+    }
+
+    /// A redirect target that already carries a query keeps its existing
+    /// parameters; the flash is appended with `&`.
+    #[test]
+    fn flash_redirect_merges_into_an_existing_query() {
+        let response = flash_redirect("/admin/proxies?page=2", "done", "error");
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("flash_redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.starts_with("/admin/proxies?page=2&flash="),
+            "{location}"
+        );
+        assert!(location.ends_with("&flash_level=error"), "{location}");
     }
 
     /// `?page=i64::MAX` overflowed the offset multiply: a debug build panicked
@@ -971,7 +1216,7 @@ mod tests {
         // A single page renders nothing (the templates check len > 1).
         assert_eq!(pagination_pages(1, 7, 50), vec![(1, true)]);
         // A page beyond the end clamps to the last page; the window then
-        // covers everything up to it — no gap needed for four pages.
+        // covers everything up to it, no gap needed for four pages.
         let window = pagination_pages(i64::MAX, 40, 10);
         assert_eq!(window, vec![(1, false), (2, false), (3, false), (4, true)]);
     }
@@ -998,5 +1243,120 @@ mod tests {
         // The old FormMap behavior, for contrast: last value wins.
         let Query(map) = Query::<FormMap>::try_from_uri(&uri).expect("query parses");
         assert_eq!(map.get("status").map(String::as_str), Some("quarantine"));
+    }
+
+    /// The language the shared form-validation helpers translate with: the
+    /// embedded catalogs, without touching a locales directory.
+    fn test_lang() -> Lang {
+        crate::admin::i18n::Locales::load(std::path::Path::new("/nonexistent")).default_lang()
+    }
+
+    /// The shared pipeline form validation: raw mode takes the textarea
+    /// verbatim, reports broken JSON as a `pipeline`-field error and
+    /// stores a well-formed document as-is.
+    #[test]
+    fn pipeline_from_form_accepts_raw_json_and_reports_bad_input() {
+        let lang = test_lang();
+
+        // No mode field = raw mode; an empty textarea stores no pipeline.
+        let mut errors = Vec::new();
+        assert_eq!(pipeline_from_form(&[], &lang, &mut errors), None);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        // A well-formed minimal document is accepted verbatim.
+        let form = vec![("pipeline".to_string(), r#"{"version": 1}"#.to_string())];
+        let mut errors = Vec::new();
+        let pipeline = pipeline_from_form(&form, &lang, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            pipeline.as_ref(),
+            Some(&serde_json::json!({ "version": 1 }))
+        );
+
+        // Broken JSON is reported on the pipeline field (the message
+        // carries the localized prefix plus the serde detail).
+        let form = vec![("pipeline".to_string(), "{oops".to_string())];
+        let mut errors = Vec::new();
+        assert_eq!(pipeline_from_form(&form, &lang, &mut errors), None);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, "pipeline");
+        assert!(errors[0].1.contains("key must be a string"), "{errors:?}");
+
+        // The cap fires on the raw text (what the textarea holds), before
+        // any parse: a document over `PIPELINE_BYTES` is refused outright.
+        let form = vec![("pipeline".to_string(), "x".repeat(caps::PIPELINE_BYTES + 1))];
+        let mut errors = Vec::new();
+        assert_eq!(pipeline_from_form(&form, &lang, &mut errors), None);
+        assert!(
+            errors
+                .iter()
+                .any(|(field, message)| field == "pipeline" && message.contains("65536")),
+            "{errors:?}"
+        );
+    }
+
+    /// Builder mode: an empty widget emits nothing, a filled row is
+    /// generated server-side into the stored JSON, and the generated
+    /// document is held to the same cap (measured compact, via
+    /// `pipeline_size`).
+    #[test]
+    fn pipeline_from_form_builds_from_widget_rows_in_builder_mode() {
+        let lang = test_lang();
+
+        // No widget rows: the generated document is only `{"version": 1}`,
+        // which the builder drops (nothing configured).
+        let form = vec![("pipeline_mode".to_string(), "builder".to_string())];
+        let mut errors = Vec::new();
+        assert_eq!(pipeline_from_form(&form, &lang, &mut errors), None);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        // One rename row generates a stored pipeline.
+        let form: Vec<(String, String)> = [
+            ("pipeline_mode", "builder"),
+            ("ped_rename_0_match", "chrome"),
+            ("ped_rename_0_replace", "firefox"),
+            ("ped_rename_0_target", "param"),
+            ("ped_rename_0_key", "fp"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut errors = Vec::new();
+        let pipeline = pipeline_from_form(&form, &lang, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        let pipeline = pipeline.expect("a filled widget row must store a pipeline");
+        assert_eq!(pipeline["rename"][0]["match"], "chrome");
+
+        // The builder ignores a stale raw textarea, as before.
+        let form: Vec<(String, String)> = [
+            ("pipeline_mode", "builder"),
+            ("pipeline", "{oops"),
+            ("ped_rename_0_match", "chrome"),
+            ("ped_rename_0_replace", "firefox"),
+            ("ped_rename_0_target", "param"),
+            ("ped_rename_0_key", "fp"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut errors = Vec::new();
+        assert!(pipeline_from_form(&form, &lang, &mut errors).is_some());
+        assert!(
+            errors.is_empty(),
+            "the stale textarea must be ignored: {errors:?}"
+        );
+    }
+
+    /// The slug rules are shared and compiled once: the same format rules
+    /// the import path applies, matched against a `LazyLock` regex.
+    #[test]
+    fn slug_re_holds_the_shared_format_rules() {
+        assert!(SLUG_RE.is_match("ab"));
+        assert!(SLUG_RE.is_match("a-b_c9"));
+        assert!(!SLUG_RE.is_match("a")); // too short
+        assert!(!SLUG_RE.is_match("-ab")); // must start alphanumeric
+        assert!(!SLUG_RE.is_match("a b")); // space outside the charset
+        assert!(!SLUG_RE.is_match(&"a".repeat(65))); // too long
+        assert!(SLUG_RE.is_match(&"a".repeat(64)));
     }
 }

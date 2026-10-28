@@ -5,7 +5,7 @@ members = ["crates/fumox-core", "crates/fumox-server", "crates/fumox-probe"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.98"
 license = "MIT"
 
 [workspace.dependencies]
@@ -15,6 +15,10 @@ fumox-core = { path = "crates/fumox-core" }
 # Async runtime / HTTP
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
+# `ServiceExt::oneshot` drives the router in the fumox-server tests;
+# `BodyExt::collect` reads response bodies there.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 # reqwest 0.13: rustls is the default TLS backend and `rustls-tls` became
 # `rustls`. The provider is aws-lc by default; we stay on ring to match the
 # `rustls` crate's provider above (one crypto provider in the process).
@@ -51,7 +55,7 @@ toml = "1"
 toml_edit = { version = "0.25", features = ["display"] }
 
 # Database
-# sqlx 0.9: query*() takes `impl SqlSafeStr` — `&'static str` directly,
+# sqlx 0.9: query*() takes `impl SqlSafeStr`, `&'static str` directly,
 # dynamic SQL wrapped in `sqlx::AssertSqlSafe`.
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
 
@@ -71,6 +75,7 @@ nanoid = "0.5"
 regex = "1"
 base64 = "0.23"
 url = "2"
+ipnet = "2"
 percent-encoding = "2"
 sha2 = "0.11"
 hmac = "0.13"

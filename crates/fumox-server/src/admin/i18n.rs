@@ -1,10 +1,10 @@
 //! Admin panel internationalization.
 //!
-//! Message catalogs live in external TOML files — one file per language,
+//! Message catalogs live in external TOML files, one file per language,
 //! file name (without extension) is the language code: `locales/ru.toml`,
 //! `locales/en.toml`, … The directory is `[admin].locales_dir` (default
 //! `locales/`, relative to the working directory). Dropping a new file into
-//! the directory and restarting the server adds a language — no rebuild.
+//! the directory and restarting the server adds a language, no rebuild.
 //!
 //! The shipped `ru`/`en` catalogs are also compiled into the binary as a
 //! fallback, so a bare binary without a locales directory still renders the
@@ -264,12 +264,29 @@ pub fn lang_cookie(code: &str) -> String {
     format!("{LANG_COOKIE}={code}; Path=/; HttpOnly; SameSite=Lax; Max-Age={LANG_MAX_AGE_SECS}")
 }
 
-/// Add the `t()` and `lang_code()` template helpers to a template struct
-/// that carries a `lang: Lang` field. The result borrows from the struct,
-/// which owns (via `Arc`) the catalog. `allow` silences per-template
-/// unused-helper warnings: which helpers a template actually calls is only
-/// known to askama.
+/// Add the shared template helpers to a template struct that carries a
+/// `lang: Lang` field. The result borrows from the struct, which owns
+/// (via `Arc`) the catalog. `allow` silences per-template unused-helper
+/// warnings: which helpers a template actually calls is only known to
+/// askama.
+///
+/// Form templates that additionally carry an `errors: Vec<(String, String)>`
+/// field use the `impl_i18n!(Type, errors)` form, which adds `error_for`
+/// for the per-field validation messages.
 macro_rules! impl_i18n {
+    ($ty:ty, errors) => {
+        impl_i18n!($ty);
+        impl $ty {
+            /// First error message attached to a form field, if any.
+            #[allow(dead_code)]
+            fn error_for(&self, field: &str) -> Option<&str> {
+                self.errors
+                    .iter()
+                    .find(|(f, _)| f == field)
+                    .map(|(_, m)| m.as_str())
+            }
+        }
+    };
     ($ty:ty) => {
         impl $ty {
             #[allow(dead_code)]
@@ -304,7 +321,7 @@ macro_rules! impl_i18n {
                 self.lang.t(key).to_string()
             }
             /// Display name of a proxy: the source-provided name, or the
-            /// server address when the source sent none — an empty name
+            /// server address when the source sent none, an empty name
             /// would render an empty, unclickable-looking link. Whitespace
             /// only counts as empty: it displays as nothing.
             #[allow(dead_code)]
@@ -314,6 +331,19 @@ macro_rules! impl_i18n {
                 } else {
                     name.to_string()
                 }
+            }
+            /// Render a Unix timestamp as a `<time class="ts">` element
+            /// (see [`crate::admin::handlers::fmt_ts_element`]); the
+            /// template emits it through `| safe`.
+            #[allow(dead_code)]
+            fn ts(&self, ts: &i64) -> String {
+                crate::admin::handlers::fmt_ts_element(*ts)
+            }
+            /// [`Self::ts`] for optional timestamps; `None` renders the en
+            /// dash used across the admin tables (plain text, no element).
+            #[allow(dead_code)]
+            fn opt_ts(&self, ts: &Option<i64>) -> String {
+                crate::admin::handlers::fmt_opt_ts_element(*ts)
             }
         }
     };
@@ -361,6 +391,23 @@ mod tests {
                 catalog.contains_key(LANG_NAME_KEY),
                 "lang.name missing in {code}"
             );
+        }
+        // The probe banner's recommendation labels and the idle factor
+        // are resolved through the catalog, so every one of them must
+        // exist in both languages and actually be translated (an
+        // unresolved key echoes itself).
+        for key in [
+            "probe.rec_sample_size",
+            "probe.rec_cycle_interval_secs",
+            "probe.rec_concurrency",
+            "probe.factor_all_idle",
+        ] {
+            for (code, catalog) in &catalogs {
+                let text = catalog
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{key} missing in {code}"));
+                assert_ne!(text, key, "{key} is untranslated in {code}");
+            }
         }
     }
 
@@ -423,7 +470,7 @@ mod tests {
         let args: Vec<(&str, String)> = vec![("path", path)];
         let en = locales.resolve("en").t_named("set.editing_path", &args);
         assert_eq!(en, "Editing: /etc/fumox/app.toml");
-        // Missing arguments leave their placeholder visible — same contract
+        // Missing arguments leave their placeholder visible, same contract
         // as `t_args`, so a missing translation or a refactor that drops a
         // placeholder is obvious instead of silently blank.
         assert_eq!(
@@ -503,6 +550,68 @@ mod tests {
         );
     }
 
+    /// The scan must also be able to fail on its own terms: with the real
+    /// templates and the real catalogs both in the green state, a filter
+    /// that silently matches nothing would leave the guard above passing
+    /// forever. Here a key a template resolves is removed from one catalog
+    /// and must be reported, for each of the three helpers.
+    #[test]
+    fn template_key_scan_reports_keys_absent_from_a_catalog() {
+        let template = concat!(
+            r#"{{ self.t("nav.dashboard") }}"#,
+            r#"{{ self.t_args("probe.recs_head", &[]) }}"#,
+            r#"{{ self.t_named("set.editing_path", &[]) }}"#,
+        );
+        let keys: Vec<String> = TEMPLATE_KEY_RE
+            .captures_iter(template)
+            .map(|caps| caps[1].to_string())
+            .collect();
+        assert_eq!(
+            keys,
+            ["nav.dashboard", "probe.recs_head", "set.editing_path"]
+        );
+
+        let full: HashMap<String, String> =
+            keys.iter().map(|key| (key.clone(), key.clone())).collect();
+        let catalogs = vec![
+            ("en".to_string(), full.clone()),
+            ("ru".to_string(), full.clone()),
+        ];
+        assert!(
+            missing_keys(template, &catalogs).is_empty(),
+            "a fully translated key must not be reported"
+        );
+
+        for absent in &keys {
+            let mut trimmed = full.clone();
+            trimmed.remove(absent);
+            let one_short = vec![
+                ("en".to_string(), full.clone()),
+                ("ru".to_string(), trimmed),
+            ];
+            assert_eq!(
+                missing_keys(template, &one_short),
+                vec![format!("{absent} (ru)")],
+                "a key used in a template but missing from one catalog must be reported"
+            );
+        }
+    }
+
+    /// Key references in one template source that no catalog defines,
+    /// as `"<key> (<language>)"`.
+    fn missing_keys(text: &str, catalogs: &[(String, HashMap<String, String>)]) -> Vec<String> {
+        let mut missing = Vec::new();
+        for captures in TEMPLATE_KEY_RE.captures_iter(text) {
+            let key = &captures[1];
+            for (code, catalog) in catalogs {
+                if !catalog.contains_key(key) {
+                    missing.push(format!("{key} ({code})"));
+                }
+            }
+        }
+        missing
+    }
+
     fn visit_templates(
         dir: &std::path::Path,
         catalogs: &[(String, HashMap<String, String>)],
@@ -514,19 +623,50 @@ mod tests {
                 visit_templates(&path, catalogs, missing);
             } else if path.extension().is_some_and(|ext| ext == "html") {
                 let text = std::fs::read_to_string(&path).expect("template readable");
-                for captures in TEMPLATE_KEY_RE.captures_iter(&text) {
-                    let key = &captures[1];
-                    for (code, catalog) in catalogs {
-                        if !catalog.contains_key(key) {
-                            missing.push(format!("{}: {key} ({code})", path.display()));
-                        }
-                    }
-                }
+                missing.extend(
+                    missing_keys(&text, catalogs)
+                        .into_iter()
+                        .map(|entry| format!("{}: {entry}", path.display())),
+                );
             }
         }
     }
 
+    /// The `\b` is load-bearing: without it any helper whose name ends in `t`
+    /// (`self.range_text("…")`) is read as a catalog lookup for the wrong key.
     static TEMPLATE_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"t\("([a-z0-9_.]+)"\)"#).expect("valid regex")
+        regex::Regex::new(r#"\b(?:t_args|t_named|t)\("([a-z0-9_.]+)""#).expect("valid regex")
     });
+
+    /// A form template as the macro consumers shape them: `lang` plus an
+    /// `errors` field, exercising both macro arms.
+    struct FakeFormTemplate {
+        lang: Lang,
+        errors: Vec<(String, String)>,
+    }
+
+    impl_i18n!(FakeFormTemplate, errors);
+
+    /// The timestamp and per-field-error helpers live in the macro, so a
+    /// change to one of them reaches every template at once.
+    #[test]
+    fn macro_helpers_render_timestamps_and_field_errors() {
+        let locales = Locales::load(Path::new("/nonexistent-locales-dir"));
+        let template = FakeFormTemplate {
+            lang: locales.resolve("en"),
+            errors: vec![("name".into(), "required".into())],
+        };
+
+        assert_eq!(
+            template.ts(&1_700_000_000),
+            "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
+        );
+        assert_eq!(template.opt_ts(&None), "–");
+        assert_eq!(
+            template.opt_ts(&Some(1_700_000_000)),
+            template.ts(&1_700_000_000)
+        );
+        assert_eq!(template.error_for("name"), Some("required"));
+        assert_eq!(template.error_for("missing"), None);
+    }
 }

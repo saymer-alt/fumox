@@ -1,4 +1,4 @@
-# Fumox + meow-rs — one-command deployment: three containers (server, probe,
+# Fumox + meow-rs, one-command deployment: three containers (server, probe,
 # meow) wired through shared volumes and env overrides.
 #
 # Quick start:
@@ -9,9 +9,9 @@
 #   open http://127.0.0.1:8081/admin   # admin panel (login with the token)
 #
 # Services:
-#   server  fumox-server — public /sub + /src on :8080, admin panel on :8081
-#   probe   fumox-probe  — health-check daemon (T1 TCP/TLS + T2 tunnel checks)
-#   meow    meow-rs      — mihomo-compatible kernel the probe drives for T2
+#   server  fumox-server : public /sub + /src on :8080, admin panel on :8081
+#   probe   fumox-probe  : health-check daemon (T1 TCP/TLS + T2 tunnel checks)
+#   meow    meow-rs      : mihomo-compatible kernel the probe drives for T2
 #
 # How the probe ↔ meow wiring works:
 #   - probe reaches the meow-rs REST API at meow:9090 (FUMOX_MEOW__API_ADDR);
@@ -24,15 +24,26 @@
 # Config file location: the services point the loader at the mounted
 # ./config volume explicitly (FUMOX_CONFIG=/app/config/app.toml, the default
 # the image would use anyway). Set FUMOX_CONFIG in .env to a different file
-# name inside that volume (e.g. /app/config/prod.toml) — remember the
+# name inside that volume (e.g. /app/config/prod.toml), remember the
 # mounted file must exist, a missing one is a startup error.
 #
 # Volumes:
 #   fumox-data   SQLite database, shared by server and probe -> /app/data
 #   meow-shared  generated Clash config exchange             -> /shared
-#   ./config     app.toml + GeoLite2 .mmdb files (read-only) -> /app/config
-#                Drop GeoLite2-City.mmdb (or ASN) into ./config to
-#                enable geo enrichment; it is gitignored and not bundled.
+#   ./config     app.toml                                   -> /app/config
+#                (probe always :ro; the server :rw so the admin
+#                *Edit settings* page can save, or :ro with
+#                FUMOX_CONFIG_ACCESS=ro)
+#
+# GeoLite2 .mmdb files do NOT go into ./config: both services set
+# FUMOX_GEO__DB_DIR=/shared (the meow-shared volume, the same place
+# /shared/meow.yaml goes), and the environment outranks config/app.toml,
+# so ./config is never scanned for databases. The server downloads them
+# into /shared at startup, which is why the manual step below is optional
+# and needs no action on a stock `docker compose up`. To supply your own
+# MaxMind files, copy them into that volume:
+#   docker compose cp GeoLite2-City.mmdb server:/shared/
+# or drop the FUMOX_GEO__DB_DIR override and set [geo].db_dir instead.
 
 services:
   server:
@@ -42,7 +53,7 @@ services:
       # `mounts` builds through persistent BuildKit cache mounts: rebuilds
       # after a source change recompile only the workspace crates (~1 min
       # instead of ~7.5). Set FUMOX_BUILD_CACHE=layers in .env on builders
-      # without cache-mount support (e.g. podman-compose) — that path uses
+      # without cache-mount support (e.g. podman-compose), that path uses
       # the classic cargo-chef image layers. See the Dockerfile header.
       args:
         BUILD_CACHE: ${FUMOX_BUILD_CACHE:-mounts}
@@ -54,18 +65,27 @@ services:
       # Add `; Secure` to the admin session cookie. Set true when the panel is
       # reached through an HTTPS front (reverse proxy with TLS); leave false
       # for plain-HTTP localhost access (browsers drop Secure cookies on
-      # http://). The shipped config/app.toml has this on; override via .env.
+      # http://). config/app.toml ships this off; the compose default here is
+      # true (ready for an HTTPS front), so a plain-HTTP stand must pin
+      # FUMOX_ADMIN__SECURE_COOKIES=false in .env.
       FUMOX_ADMIN__SECURE_COOKIES: ${FUMOX_ADMIN__SECURE_COOKIES:-true}
       FUMOX_GEO__DB_DIR: /shared
       # SSRF guard: set true in .env only for trusted local test setups
       # (source URLs may then point at private/loopback addresses).
       FUMOX_ADMIN__ALLOW_PRIVATE_URLS: ${FUMOX_ADMIN__ALLOW_PRIVATE_URLS:-false}
+      # GeoLite2 databases live in the meow-shared volume, not in ./config:
+      # the env layer outranks config/app.toml, so [geo].db_dir = "config"
+      # from the file is ignored by this stack. See the Volumes header.
     volumes:
       # Writable: the admin *Edit settings* page writes /app/config/app.toml
-      # in place via the toml_edit-backed editor (see USERGUIDE §7). If you
-      # want config edits off, drop the `:rw` (server) and the editor
-      # renders disabled with the `set.edit_unwritable` banner.
-      - ./config:/app/config:rw,z
+      # in place via the toml_edit-backed editor (see USERGUIDE §7). Set
+      # FUMOX_CONFIG_ACCESS=ro in .env to turn config edits off, the editor
+      # then renders disabled with the `set.edit_unwritable` banner. That is
+      # what scripts/smoke-up.sh does: only the named volumes are
+      # project-scoped, the bind mount is the same host ./config for every
+      # compose project, so a writable mount would let the smoke stand's
+      # admin panel overwrite the main stack's app.toml.
+      - ./config:/app/config:${FUMOX_CONFIG_ACCESS:-rw},z
       - fumox-data:/app/data
       - meow-shared:/shared
     ports:
@@ -76,8 +96,19 @@ services:
       - "${FUMOX_ADMIN_BIND:-127.0.0.1}:${FUMOX_ADMIN_PORT:-8081}:8081"   # admin panel: loopback-only by
       # default; put a reverse proxy / SSH tunnel in
       # front to expose it
+    # Readiness gate for the probe below. The server runs its migrations
+    # before the listeners bind, so a 200 here means the schema is current
+    # and the probe cannot race the server into a second CREATE INDEX on a
+    # large `proxies` table. The runtime image ships no curl or wget, so
+    # the probe is the binary itself.
+    healthcheck:
+      test: ["CMD", "fumox-server", "--health-check"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
       #
-      # HTTPS front (optional): docker/nginx/ holds a ready example —
+      # HTTPS front (optional): docker/nginx/ holds a ready example,
       # an nginx container terminating TLS for /sub (→ server:8080) and
       # /admin (→ server:8081), with ACME challenges on port 80. Add:
       #
@@ -89,15 +120,20 @@ services:
       #
       # …and set FUMOX_ADMIN__SECURE_COOKIES=true (the panel is HTTPS-only
       # behind the front). The server ports above can then be unpublished
-      # entirely — nginx reaches both listeners over the compose network.
+      # entirely, nginx reaches both listeners over the compose network.
     restart: unless-stopped
 
   probe:
     image: ghcr.io/viktor45/fumox:latest         # same image as server, different command
     command: ["fumox-probe"]
     depends_on:
-      - server                 # let the server create/migrate the DB first
-      - meow                   # probe seeds /shared through the meow image
+      # service_healthy, not a bare list entry: `depends_on` without a
+      # condition only waits for the container to start, which said nothing
+      # about whether the server had finished migrating the shared volume.
+      server:
+        condition: service_healthy
+      meow:                    # probe seeds /shared through the meow image
+        condition: service_started
     environment:
       FUMOX_CONFIG: ${FUMOX_CONFIG:-/app/config/app.toml}
       FUMOX_GEO__DB_DIR: /shared
@@ -105,8 +141,13 @@ services:
       FUMOX_MEOW__CONFIG_PATH: /shared/meow.yaml
       # Override in .env if the default test URL is blocked in your region.
       FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-http://www.gstatic.com/generate_204}
+      # SSRF guard for dial targets, mirroring the server's
+      # ALLOW_PRIVATE_URLS handling: feeds are untrusted, so the probe must
+      # not dial loopback/RFC1918/link-local/CGNAT addresses they carry.
+      # Set true in .env only for isolated test infrastructure.
+      FUMOX_PROBE__ALLOW_PRIVATE_TARGETS: ${FUMOX_PROBE__ALLOW_PRIVATE_TARGETS:-false}
     volumes:
-      # Probe only reads app.toml at startup — never writes. Read-only mount
+      # Probe only reads app.toml at startup, never writes. Read-only mount
       # means a buggy probe can never mangle the config the server is also
       # editing.
       - ./config:/app/config:ro,z
@@ -125,7 +166,7 @@ services:
       args:
         # "latest" (default) resolves the newest meow-rs release at build
         # time via the GitHub API. Set MEOW_VERSION in .env to a tag
-        # (e.g. v0.21.2) to pin a specific release instead.
+        # (e.g. v0.22.0) to pin a specific release instead.
         MEOW_VERSION: ${MEOW_VERSION:-latest}
     image: ghcr.io/viktor45/fumox-meow:latest
     volumes:

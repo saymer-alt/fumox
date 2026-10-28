@@ -4,7 +4,7 @@
 //! security review v2).
 //!
 //! Proxy hosts and ports arrive from remote subscription feeds and were
-//! previously dialed by the probe with no vetting at all — a feed line like
+//! previously dialed by the probe with no vetting at all, a feed line like
 //! `vless://uuid@169.254.169.254:80#x` turned the daemon into an internal
 //! port scanner. Both call sites now run every candidate through
 //! [`check_ip`] with the same blocklist.
@@ -33,7 +33,7 @@ pub fn pick_vetted(addrs: &[IpAddr], family: IpFamily) -> Option<IpAddr> {
 }
 
 /// Async DNS resolution with an operator-supplied timeout. Async DNS has no
-/// built-in timeout — a hostile authoritative resolver can pin the runtime
+/// built-in timeout, a hostile authoritative resolver can pin the runtime
 /// worker for the OS resolver's default (~30 s+). The single
 /// `tokio::net::lookup_host` wrapper is preferred over per-family A/AAAA
 /// split because the latter would double wire DNS traffic on every
@@ -76,8 +76,17 @@ where
 /// RFC 1918 private space, link-local (incl. the `169.254.169.254` cloud
 /// metadata endpoint), CGNAT, unspecified, broadcast, multicast and
 /// benchmark ranges, TEST-NET documentation space, plus their IPv6
-/// equivalents, IPv4-mapped IPv6 addresses and the IPv6 transition
-/// ranges that embed IPv4 (NAT64 `64:ff9b::/96`, 6to4 `2002::/16`).
+/// equivalents (incl. the deprecated `fec0::/10` site-local block), the
+/// IPv4-mapped `::ffff:0:0/96` and IPv4-compatible `::/96` forms, and the
+/// NAT64 `64:ff9b::/96` and 6to4 `2002::/16` transition ranges.
+///
+/// That list is the enforced set, not "every spelling of an IPv4 address":
+/// the IPv4-translated prefix `::ffff:0:0:0/96` is neither
+/// `to_ipv4_mapped()` nor `to_ipv4()`, and Teredo `2001:0000::/32` is not
+/// matched either, so an address in either of them passes this gate.
+/// Neither is routable on a default host (Teredo needs its own interface),
+/// which is why neither is a hole an attacker can dial today, but a
+/// caller must not read this function as covering them.
 pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
     if allow_private {
         return Ok(());
@@ -94,6 +103,15 @@ pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
             if v6.is_unspecified() {
                 return Err("unspecified address".into());
             }
+            // IPv4-compatible ::/96 (deprecated, RFC 4291 §2.5.5.1 but still
+            // what a crafted feed line reaches for): the low 32 bits are a
+            // plain IPv4 address, so `::a9fe:a9fe` must be vetted as
+            // 169.254.169.254. `to_ipv4()` also covers the mapped form
+            // handled above; keeping the two apart preserves the distinct
+            // reason strings. `::` and `::1` are already handled above.
+            if let Some(compat) = v6.to_ipv4() {
+                return check_ipv4(compat);
+            }
             if v6.is_multicast() {
                 // ff00::/8, includes the often-routable ff02::1.
                 return Err("multicast address".into());
@@ -107,8 +125,13 @@ pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
             if segments[0] & 0xfe00 == 0xfc00 {
                 return Err("unique-local address".into());
             }
+            // fec0::/10 site-local (deprecated by RFC 3879, but still
+            // unicast space an internal service can be addressed on).
+            if segments[0] & 0xffc0 == 0xfec0 {
+                return Err("site-local address (deprecated fec0::/10)".into());
+            }
             // NAT64 well-known prefix 64:ff9b::/96: the low 32 bits are an
-            // IPv4 address — vet the embedded address, not the wrapper
+            // IPv4 address, vet the embedded address, not the wrapper
             // (2001:db8::/32-only U64 prefix 64:ff9b:1::/48 is public space
             // and falls through).
             if segments[0] == 0x0064
@@ -140,9 +163,9 @@ fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
 
 /// Whether a proxy host may be dialed by the probe: IP literals are vetted
 /// directly; hostnames are rejected when they cannot be resolved to a
-/// vetted address (fail closed — an unresolvable name must never become a
+/// vetted address (fail closed, an unresolvable name must never become a
 /// probe target). Returns the full list of vetted addresses so the caller
-/// can dial them directly instead of re-resolving the hostname — a second
+/// can dial them directly instead of re-resolving the hostname, a second
 /// DNS lookup between vet and connect would reopen the rebinding window
 /// the first lookup just closed.
 ///
@@ -150,7 +173,7 @@ fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
 /// every caller is on a Tokio task, and the previous synchronous
 /// `std::net::ToSocketAddrs` blocked the runtime worker for the full
 /// resolver timeout. The timeout is the operator's `[geo].dns_timeout_secs`
-/// knob — see [`lookup_with_timeout`] for the rationale.
+/// knob, see [`lookup_with_timeout`] for the rationale.
 pub async fn vet_probe_host_addrs(
     host: &str,
     allow_private: bool,
@@ -161,6 +184,17 @@ pub async fn vet_probe_host_addrs(
         return Ok(vec![ip]);
     }
     let lookup = lookup_with_timeout(host, dns_timeout).await?;
+    vet_resolved_addrs(host, allow_private, lookup)
+}
+
+/// The policy and the per-host cap applied to one resolver answer list,
+/// split out of [`vet_probe_host_addrs`] so the cap can be tested against a
+/// recorded `getaddrinfo` ordering without live DNS.
+fn vet_resolved_addrs(
+    host: &str,
+    allow_private: bool,
+    lookup: Vec<IpAddr>,
+) -> Result<Vec<IpAddr>, String> {
     let mut addrs: Vec<IpAddr> = Vec::new();
     for ip in lookup {
         check_ip(ip, allow_private).map_err(|reason| format!("{host}: {reason}"))?;
@@ -171,11 +205,79 @@ pub async fn vet_probe_host_addrs(
     if addrs.is_empty() {
         return Err(format!("DNS resolution returned no addresses for {host}"));
     }
-    Ok(addrs)
+    Ok(cap_vetted(&addrs))
 }
 
+/// Cap a vetted address list at [`MAX_VETTED_ADDRESSES`] without letting the
+/// cap delete a whole address family.
+///
+/// A plain `truncate` is wrong here: `getaddrinfo` orders dual-stack answers
+/// IPv6-first and CDN-fronted names publish more AAAA records than A ones, so
+/// the window can close before the only A record, and the callers
+/// (`pick_vetted` with `IpFamily::Any`, which prefers IPv4 and falls back to
+/// the first address) then dial or pin a wrong-family address. One slot per
+/// family is therefore reserved first, and the remaining slots are filled in
+/// resolver order; the returned list is still at most
+/// [`MAX_VETTED_ADDRESSES`] long, so the per-candidate dial budget the cap
+/// exists to bound is unchanged.
+fn cap_vetted(addrs: &[IpAddr]) -> Vec<IpAddr> {
+    if addrs.len() <= MAX_VETTED_ADDRESSES {
+        return addrs.to_vec();
+    }
+    let mut keep = vec![false; addrs.len()];
+    let mut kept = 0usize;
+    let mut v4_reserved = false;
+    let mut v6_reserved = false;
+    for (i, ip) in addrs.iter().enumerate() {
+        if ip.is_ipv4() {
+            if v4_reserved {
+                continue;
+            }
+            v4_reserved = true;
+        } else {
+            if v6_reserved {
+                continue;
+            }
+            v6_reserved = true;
+        }
+        keep[i] = true;
+        kept += 1;
+        if kept == MAX_VETTED_ADDRESSES {
+            break;
+        }
+    }
+    for keep_i in keep.iter_mut() {
+        if kept == MAX_VETTED_ADDRESSES {
+            break;
+        }
+        if !*keep_i {
+            *keep_i = true;
+            kept += 1;
+        }
+    }
+    addrs
+        .iter()
+        .zip(keep)
+        .filter_map(|(ip, keep_i)| keep_i.then_some(*ip))
+        .collect()
+}
+
+/// Upper bound on the vetted addresses returned per host. DNS can resolve
+/// a feed-supplied name to dozens of A/AAAA records, and every returned
+/// address becomes one dial attempt holding a probe concurrency permit
+/// (T1) or one pinned entry in a meow batch config (T2), without the cap
+/// one hostname stretches a whole probe cycle by
+/// `count × connect_timeout` (security review f9). Real frontends resolve
+/// to a handful of addresses, so the tail beyond the cap is dropped.
+///
+/// The bound is on the list, not on what a family may claim: the tail can
+/// hold the only address of a family the caller needs, so the tail is
+/// dropped in favour of the first address of each family, see
+/// [`cap_vetted`].
+const MAX_VETTED_ADDRESSES: usize = 4;
+
 /// Same policy as [`vet_probe_host_addrs`], discarding the resolved
-/// addresses — for dial paths that cannot pin the IP (e.g. a tunnel engine
+/// addresses, for dial paths that cannot pin the IP (e.g. a tunnel engine
 /// resolving the host itself).
 pub async fn vet_probe_host(
     host: &str,
@@ -280,6 +382,34 @@ mod tests {
         }
     }
 
+    /// Every IPv6 spelling of a blocked IPv4 address must be blocked, not
+    /// just the mapped form: a feed line writing the metadata endpoint as
+    /// `[::a9fe:a9fe]` must not walk past a policy that only vets
+    /// `to_ipv4_mapped()`. The deprecated `fec0::/10` site-local block is
+    /// in the same shape, routable unicast, never a public target.
+    #[test]
+    fn ipv4_compatible_and_site_local_v6_are_blocked() {
+        for addr in [
+            // ::/96 IPv4-compatible: 127.0.0.1, 169.254.169.254, 192.168.0.1
+            "::7f00:1",
+            "::a9fe:a9fe",
+            "::c0a8:1",
+            // fec0::/10 site-local, deprecated but unicast.
+            "fec0::1",
+            "feff:ffff::1",
+        ] {
+            assert!(check_ip(ip(addr), false).is_err(), "{addr} must be blocked");
+        }
+        // fec0::/10 ends at feff:ffff, whose upper neighbour ff00::/8 is
+        // multicast, so there is no public address to check on that edge.
+        // The lower neighbour febf:... is fe80::/10 link-local and stays
+        // blocked under its own rule.
+        assert!(check_ip(ip("febf:ffff::1"), false).is_err());
+        // ::/96 with a public payload is public space too, the 6to4-style
+        // payload rule, not a blanket prefix ban.
+        assert!(check_ip(ip("::8.8.8.8"), false).is_ok());
+    }
+
     #[test]
     fn transition_prefixes_with_public_payloads_pass() {
         // The local-use U64 prefix 64:ff9b:1::/48 is public space (RFC 8215),
@@ -335,7 +465,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        // A public literal yields exactly itself — the caller dials this
+        // A public literal yields exactly itself, the caller dials this
         // address instead of re-resolving the hostname.
         let addrs = vet_probe_host_addrs("8.8.8.8", false, Duration::from_secs(5))
             .await
@@ -363,7 +493,7 @@ mod tests {
         assert!(err.contains("DNS resolution failed"), "{err}");
     }
 
-    /// The localhost loopback must fail closed under the default policy —
+    /// The localhost loopback must fail closed under the default policy ,
     /// this is the exact primitive the F1 fix removes (a feed steering the
     /// probe at the host's own services).
     #[tokio::test]
@@ -417,6 +547,62 @@ mod tests {
             err.contains("DNS resolution failed"),
             "expected DNS resolution failed error, got: {err}"
         );
+    }
+
+    /// The per-host cap must not delete an address family.
+    ///
+    /// `getaddrinfo` orders dual-stack answers IPv6-first (RFC 6724
+    /// destination selection) and CDN-fronted names routinely publish more
+    /// AAAA records than A ones, so a cap that simply truncates the
+    /// combined list drops the only A record, and the probe callers then
+    /// pick (`IpFamily::Any`, which prefers IPv4 and falls back to the
+    /// first address) or pin a wrong-family address, or dial an IPv6
+    /// address the host cannot reach from this network.
+    #[test]
+    fn vetted_address_cap_keeps_both_families() {
+        let v4 = "142.251.153.119".parse::<IpAddr>().unwrap();
+        let v6s: Vec<IpAddr> = (1..=6)
+            .map(|i| format!("2606:4700:4700::{i:x}").parse().unwrap())
+            .collect();
+
+        // Six AAAA then one A, the ordering the resolver hands back.
+        let mut lookup = v6s.clone();
+        lookup.push(v4);
+        let vetted = vet_resolved_addrs("cdn.example.com", false, lookup).unwrap();
+        assert!(
+            vetted.len() <= MAX_VETTED_ADDRESSES,
+            "cap must still bound the dial budget, got {}",
+            vetted.len()
+        );
+        assert!(
+            vetted.contains(&v4),
+            "cap dropped the only A record, kept {vetted:?}"
+        );
+        assert_eq!(
+            pick_vetted(&vetted, IpFamily::Any),
+            Some(v4),
+            "the caller must still be able to pick the A record out of {vetted:?}"
+        );
+
+        // The mirror image: five A records then one AAAA.
+        let mut lookup: Vec<IpAddr> = (1..=5)
+            .map(|i| format!("93.184.216.{i}").parse().unwrap())
+            .collect();
+        let only_v6 = "2606:4700:4700::1111".parse::<IpAddr>().unwrap();
+        lookup.push(only_v6);
+        let vetted = vet_resolved_addrs("cdn.example.com", false, lookup).unwrap();
+        assert!(vetted.len() <= MAX_VETTED_ADDRESSES);
+        assert!(
+            vetted.contains(&only_v6),
+            "cap dropped the only AAAA record, kept {vetted:?}"
+        );
+        assert_eq!(pick_vetted(&vetted, IpFamily::Ipv6), Some(only_v6));
+
+        // Resolver order survives the cap within a family, and a list that
+        // already fits is returned untouched.
+        let short = vec![v6s[0], v4, v6s[1]];
+        let vetted = vet_resolved_addrs("small.example.com", false, short.clone()).unwrap();
+        assert_eq!(vetted, short);
     }
 
     #[test]

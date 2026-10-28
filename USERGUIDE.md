@@ -70,8 +70,11 @@ Concretely, Fumox:
   sing-box JSON).
 - **Parses** every proxy line into a normalized model. Supported protocols:
   `vless`, `vmess`, `trojan`, `ss` (Shadowsocks), `hysteria2`, `tuic`, `mieru`,
-  `socks5`, `naive+https`. Parameters Fumox doesn't recognize are carried
-  through untouched: nothing is ever lost.
+  `socks5`, `naive+https`, `snell`, `anytls`. Parameters Fumox doesn't
+  recognize are carried through untouched: nothing is ever lost. Note that
+  sing-box output has no outbound type for Snell or AnyTLS, so a sing-box
+  export leaves those proxies out rather than emitting a block it cannot
+  start; the Clash and URI outputs carry them in full.
 - **Processes** proxies through a configurable pipeline: protocol filters,
   regex renaming, geo-tagging with country flags, health filtering,
   deduplication, sorting.
@@ -198,7 +201,9 @@ Useful `.env` variables (all except the token are optional):
 | `FUMOX_ADMIN_PORT`                | `8081`                                | Host port for the admin panel (always published to loopback only or `FUMOX_ADMIN_BIND`).                                                                        |
 | `FUMOX_MEOW__TEST_URL`            | `http://www.gstatic.com/generate_204` | URL used for T2 delay tests. Override if it is blocked in your region (e.g. `http://cp.cloudflare.com`).                                                         |
 | `FUMOX_ADMIN__ALLOW_PRIVATE_URLS` | `false`                               | Allow source URLs pointing at private/loopback addresses (disables the SSRF guard). Local testing only.                                                          |
-| `MEOW_VERSION`                    | `latest`                              | The meow-rs release for **local builds** of the wrapper image (`--build` mode; no effect when pulling). `latest` resolves the newest release via the GitHub API; a tag (e.g. `v0.21.2`) pins one. |
+| `FUMOX_ADMIN__SECURE_COOKIES`     | `true` (compose) / `false` (file)     | Add `; Secure` to the admin session cookie. The compose default `true` presumes an HTTPS front; set `false` in `.env` when the panel is opened over plain HTTP (`http://127.0.0.1:8081`), or every login silently fails. |
+| `FUMOX_CONFIG_ACCESS`             | `rw`                                  | Mount mode for `./config` in the **server** container. `rw` lets the admin *Edit settings* page save `app.toml`; `ro` mounts it read-only, which turns that page into a read-only view. The probe container is always `:ro`. |
+| `MEOW_VERSION`                    | `latest`                              | The meow-rs release for **local builds** of the wrapper image (`--build` mode; no effect when pulling). `latest` resolves the newest release via the GitHub API; a tag (e.g. `v0.22.0`) pins one. |
 
 Notes:
 
@@ -212,11 +217,11 @@ Notes:
 > **Behind a reverse proxy, two config keys must be set** for both the
 > `/sub` clients and the admin panel to behave correctly:
 >
-> - `[server].trust_proxy_ips` / `[admin].trust_proxy_ips` — the proxy's
+> - `[server].trust_proxy_ips` / `[admin].trust_proxy_ips`: the proxy's
 >   CIDR (`["127.0.0.1/32"]` for nginx on the same host). Without this,
 >   the per-IP rate limit collapses to one budget because every request
 >   arrives from the proxy's IP.
-> - `[server].allowed_hosts` / `[admin].allowed_hosts` — your public
+> - `[server].allowed_hosts` / `[admin].allowed_hosts`: your public
 >   hostname (`["fumox.example.com"]`). Without this, the `Host` header is
 >   trusted as-is: an attacker that can poison the `Host` reaching the
 >   listener can render admin URLs and the alive/ready export endpoints
@@ -224,13 +229,56 @@ Notes:
 >   the historical behavior behind a direct connection; the safe
 >   configuration for any reverse-proxy-fronted deployment is to set
 >   both.
-- The SQLite database lives in the `fumox-data` volume; `./config` is mounted
-  read-only for `app.toml` and GeoLite2 files.
+>
+> The two lists are checked separately. The admin panel builds the
+> alive/ready export link behind *Import / Export*, *Sources* and
+> *Profiles* from the host you reached the panel on, and those three
+> screens render whatever that host is. If you pin
+> `[server].allowed_hosts` to a public domain but reach the panel on
+> its own loopback address (`http://127.0.0.1:8081/admin`, what
+> Compose ships), the link is built as `http://127.0.0.1:8080/...` and
+> the public listener answers it `404`: it does not serve that host.
+> Either reach the panel on the same hostname the public list allows,
+> or add `127.0.0.1` to `[server].allowed_hosts` as well.
+>
+> The admin panel also answers `403` (`err.cross_site`) to requests it
+> classifies as cross-site: `Sec-Fetch-Site: cross-site` (top-level
+> navigations to `/admin` are exempt), `Origin: null`, or an `Origin`
+> whose host:port does not match the `Host` header. Browsers on the
+> panel's own origin and header-less clients (curl, monitoring) are
+> unaffected. What this adds to a reverse-proxy setup is the same
+> requirement the `Host` allowlist above already imposes: the proxy
+> must forward `Host` unchanged (the shipped `docker/nginx/` example
+> does, via `proxy_set_header Host $host`). A legitimate non-browser
+> integration that POSTs to the panel with an `Origin` header must
+> send the panel's own origin or drop the header.
+- The SQLite database lives in the `fumox-data` volume. `./config` is mounted
+  into the server container **read-write** by default, so the admin *Edit
+  settings* page can save `app.toml`; set `FUMOX_CONFIG_ACCESS=ro` to pin it
+  read-only instead (the edit page then renders read-only). The probe
+  container always mounts it `:ro`. Under Compose the GeoLite2 databases do
+  **not** live there, see [section 11](#11-geo-enrichment).
 - meow-rs publishes no official Docker image, so the small wrapper
   (`docker/meow/Dockerfile`) around the release binary is either pulled
   ready-made from GHCR or built in `--build` mode; it is published manually
   by the `docker-meow.yml` workflow (see Option B). Its REST API (port 9090)
   is only reachable from the probe over the internal network.
+- **Upgrading the engine.** Fumox drives meow-rs over a small, stable slice
+  of its REST API (`GET /version`, `PUT /configs`, `GET /proxies/{name}/delay`),
+  and that slice is unchanged across releases: 0.21.2 → 0.22.0 shipped an
+  identical 26-route surface, identical delay parameters and identical
+  404/504/503 semantics, so an upgrade is a rebuild, not a code change. Set
+  `MEOW_VERSION=v0.22.0` in `.env` to pin one (leave it `latest` to track
+  upstream HEAD). Note that 0.22.0 replaced rustls with BoringSSL runtime-wide
+  and made `ipv6` effective end-to-end, see `[meow].ipv6` below.
+- **What the 0.22.0 upgrade buys T2 immediately**, with no Fumox change: the
+  `xhttp` transport is now a real outbound (0.21.x had no XHTTP at all, so
+  such entries could not be checked), and SIP003 Shadowsocks plugins
+  (`shadow-tls`, `restls`, `jls`, `kcptun`, `gost-plugin`) run in-process
+  instead of spawning a helper binary: the `fumox-meow` image ships only the
+  `meow` binary, so plugin-backed entries that used to fail T2 now work. Both
+  were already rendered correctly by Fumox's Clash writer; only the engine
+  gained the ability to honour them.
 - **Disposable smoke stand:** `scripts/smoke-up.sh` brings the same stack up
   as a second, isolated compose project (`fumox-smoke`) on shifted ports
   (18080 public / 18081 admin; override with `SMOKE_PUBLIC_PORT` /
@@ -279,7 +327,7 @@ The meow-rs wrapper (`docker/meow/Dockerfile`) is on GHCR too,
 `ghcr.io/viktor45/fumox-meow`, but it is published **manually only**: the
 `docker-meow.yml` workflow never runs on push or tags; dispatch it from the
 Actions tab (the `meow_version` input: `latest`, the freshest release at
-build time, or a tag like `v0.21.2`). Resulting tags: the `meow_version`
+build time, or a tag like `v0.22.0`). Resulting tags: the `meow_version`
 value, `main` and `sha-<short sha>`; the attestation is the same, per
 platform. The Option A stack already references this image: `docker compose
 up -d` pulls it, `--build` compiles the wrapper locally (the `.env`
@@ -289,7 +337,7 @@ up -d` pulls it, `--build` compiles the wrapper locally (the `.env`
 
 Requirements:
 
-- Rust toolchain **≥ 1.94** (edition 2024).
+- Rust toolchain **≥ 1.98** (edition 2024).
 - System SQLite development package: sqlx links the system library, it is not
   bundled. On Debian/Ubuntu: `sudo apt install libsqlite3-dev pkg-config`.
 - No OpenSSL needed (rustls), no frontend build step.
@@ -302,11 +350,25 @@ cargo build --release
 ./target/release/fumox-probe             # health-check daemon (separate process)
 ```
 
-Both binaries accept the same command-line options:
+The command-line options differ per binary: only
+`fumox-server` has `--health-check`:
 
 ```
 fumox-server [OPTIONS]
-fumox-probe  [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>  Path to the TOML config file (outranks FUMOX_CONFIG)
+      --health-check     Probe the running server's /healthz and exit 0
+                         when it answers 200, 1 otherwise. The request
+                         goes to 127.0.0.1 at the configured public
+                         bind's port. Used as the container healthcheck
+                         (`docker-compose.yml` wires it as the stack's
+                         `test:`): the runtime image ships no curl or
+                         wget.
+  -h, --help             Print help
+  -V, --version          Print version
+
+fumox-probe [OPTIONS]
 
 Options:
   -c, --config <CONFIG>  Path to the TOML config file (outranks FUMOX_CONFIG)
@@ -441,9 +503,10 @@ was rendered. Proxy clients skip `#` lines, so the block is inert for them,
 and for another fumox consuming the link as a source. Base64 profiles do
 not carry the block: the blob must stay a plain encoded list.
 
-Clash and sing-box output can only represent vless, vmess, trojan, ss,
-hysteria2 and socks5; proxies of other protocols (tuic, mieru, naive) are
-skipped with a log entry, not an error. Duplicate display names get automatic
+Clash output can represent vless, vmess, trojan, ss, hysteria2, socks5, snell
+and anytls; sing-box has no outbound type for the last two, so they are left
+out of a sing-box export. Proxies of the remaining protocols (tuic, mieru,
+naive) are skipped with a log entry, not an error. Duplicate display names get automatic
 suffixes: `Name`, `Name (2)`, `Name (3)`…
 
 ### Country filter
@@ -495,21 +558,21 @@ panel entirely: every `/admin/*` route answers 404.
 Built-in protections: CSRF tokens on every form, per-IP rate limiting
 (`120/min` general, `5/min` on login), security response headers
 (`X-Frame-Options: DENY`, `Content-Security-Policy`, `nosniff`,
-`no-referrer`), proxy credentials masked in all lists
+`Referrer-Policy: same-origin`), proxy credentials masked in all lists
 (full value only on the proxy detail page, on explicit request).
 
 ### What's inside
 
 | Screen              | What you do there                                                                                                                                                                                     |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Dashboard**       | Totals: sources (enabled/errored), profiles, proxies by status, 24h fetch success rate, probe heartbeat, recent errors and fetches                                                                    |
+| **Dashboard**       | Totals: sources (enabled/errored), profiles, proxies by status, 24h fetch success rate with the age of the last scheduler sweep, probe heartbeat, recent errors and fetches                                                                    |
 | **Sources**         | Create/edit/enable/delete sources; *Refresh now*; per-source fetch log with error classes; the `/src/…` link                                                                                          |
 | **Profiles**        | Create/edit profiles: composition and order of sources, output format, pipeline overrides, access token, slug; output preview (first 50 lines)                                                        |
 | **Proxies**         | Filterable browser of all proxies (status, protocol, country, source, search by host/name); detail card with parameters, geo, lifecycle timestamps and probe history; *Reset status*; *Purge removed* |
 | **Fetch log**       | Journal of every source fetch: time, status, bytes, proxies found, error class                                                                                                                        |
-| **Probe**           | Health-check daemon status: heartbeat, meow-rs status, quarantine queue with scheduled second chances                                                                                                 |
+| **Probe**           | Health-check daemon status: heartbeat, meow-rs status with the kernel's live RSS (from meow-rs `GET /memory`, refreshed whenever a T2 batch reloads the engine), quarantine queue with scheduled second chances, and the history rotation panel (when the last retention run happened, what it deleted, journal size now)                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
-| **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels — every `config/app.toml` knob except the admin token, which is never rendered. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
+| **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels: nearly every `config/app.toml` knob, and never the admin token. Two keys are file-only and have no field on the page: `[server].export_max_rows` and `[geo].startup_download_budget_secs`; the file values still apply, the panel just cannot show or edit them. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
 
 ### Times and timezones
 
@@ -530,6 +593,8 @@ and access tokens) as a versioned JSON file. *Import* recreates them with
 - profile composition is remapped onto the new source ids;
 - a slug collision → the object is created without a slug (reported as a warning);
 - a reference to a source missing from the file → dropped from the composition (warning);
+- one reference used by two *source rows* → rejected (the reference binds the rows together, so the file does not say which one a profile composition means);
+- a reference repeated twice inside one *profile's* source list → kept once (the first position wins);
 - validation is all-or-nothing: any invalid object aborts the whole import
   (`422` with a list of problems, nothing written).
 
@@ -543,6 +608,32 @@ token:
 - `GET /export/ready/{token}`: the `ready` tier only (proxies that
   successfully completed both T1 and T2 checks). Same metadata shape,
   title `export/ready`.
+
+Both links are snapshots, not live views, and are bounded twice:
+
+- **At most 50 000 rows per body**, the shipped value of
+  `[server].export_max_rows`. Unlike `/sub` and `/src`, the exports
+  have no per-source or per-profile limit of their own, so a very large
+  pool would otherwise turn one download into an unbounded read and an
+  unbounded file. Raise the key when your tier is bigger. The cut takes
+  the oldest rows (lowest ids) and the `nodes count` header reports how
+  many the body really carries, so a truncated download says so. The
+  live counts next to the links are **not** capped: they show the real
+  size of each tier, which is how you see that the export is smaller
+  than the pool.
+- **Cached for 30 seconds.** A burst of downloads inside one window is
+  served from the same body, so the common case costs one render rather
+  than one per request. Refreshing the body is single-flighted too: when
+  the window has expired, the first request renders and the rest wait
+  for its fresh body rather than each rendering the tier. The
+  trade-off is staleness: a proxy that dies can still appear in a
+  body for up to 30 seconds after the change. A download is a snapshot
+  by definition, and an outdated one served quietly is worse than a
+  slightly slower request: an expired body is re-rendered, never
+  handed out stale.
+
+Because the two tiers do not overlap, a `ready` proxy appears only in
+`/export/ready`, never in `/export/alive`.
 
 `Download url_list` saves the body as a file; *Regenerate link*
 replaces the token if the link leaks (the old link stops working
@@ -588,15 +679,16 @@ Three layers, later wins:
    FUMOX_MEOW__API_ADDR=meow:9090     # [meow] api_addr
    ```
 
-   Env overrides outrank the file at every leaf — `String`, `bool`, integers
+   Env overrides outrank the file at every leaf: `String`, `bool`, integers
    and `SocketAddr` accept the env value as-is. `Vec<String>` overrides need
    a JSON array (e.g. `FUMOX_SERVER__TRUST_PROXY_IPS='["10.0.0.0/8"]'`),
    not a comma-separated string, except where a custom deserializer is
    wired in (e.g. `[meow].test_url`, which accepts both).
 
 The annotated reference file shipped with the repo is
-[`config/app.toml`](./config/app.toml). Below is the same information in table
-form.
+[`config/app.toml`](./config/app.toml). The table below lists the built-in
+defaults from `crates/fumox-core/src/config.rs`; `config/app.toml` ships
+tuned values that differ for some keys.
 
 ### `[server]` – public listener
 
@@ -607,6 +699,7 @@ form.
 | `auth_fail_rate_limit` | `"30/min"`       | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets                                                                                                                      |
 | `trust_proxy_ips`      | `[]`             | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the per-IP rate-limit and admin URL scheme. Empty = never trust forwarded headers (direct-connection default). Set this when behind nginx |
 | `allowed_hosts`        | `[]`             | Hostnames / IPs allowed to reach the public listener, including the `/export/alive/{token}` and `/export/ready/{token}` endpoints. Empty = accept any `Host` value. Set this when serving from a fixed domain name |
+| `export_max_rows`      | `50000`          | Row ceiling of one `/export/alive/{token}` / `/export/ready/{token}` body, applied as a `LIMIT` in the query behind them. These two links have no per-source or per-profile cap of their own, so this is what keeps one public download from reading and shipping the whole tier; raise it when your tier is bigger. The cut takes the lowest ids and the `nodes count` header reports what the body really carries, while the admin tier counts stay uncapped, so a truncated export is visible as smaller than the tier. `0` does not mean "unlimited": the value is clamped up to 1 row (a negative or zero `LIMIT` would otherwise read as unbounded in SQLite), so a body of `0` serves a single node. The body is cached for 30 s, so a status change can take up to 30 s to reach the link |
 
 ### `[database]` – SQLite
 
@@ -635,17 +728,18 @@ form.
 | --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `refresh_check_limit` | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue)                                                                                                       |
 | `drop_gate`           | `false` | Drop-rules gate on the alive-linger. `true`: an alive proxy of a source with `drop` rules leaves on the next refresh once a rule catches it; `false`: every source lingers, the probe alone retires proxies |
-| `removed_as_unknown`  | `false` | Revive a `removed` proxy the feed still carries: the row resets to the pristine `unknown` state (fail count and quarantine fields cleared) and walks the checks again, joining the priority queue. `false`: `removed` stays terminal — the only ways back are the admin "reset status" action or «purge removed» plus a re-insert |
+| `removed_as_unknown`  | `false` | Revive a `removed` proxy the feed still carries: the row resets to the pristine `unknown` state (fail count and quarantine fields cleared) and walks the checks again, joining the priority queue. `false`: `removed` stays terminal: the only ways back are the admin "reset status" action (which only bites on a row the probe can still reach, see below) or «purge removed» plus a re-insert |
 
 ### `[geo]` – geo enrichment
 
 | Key                 | Default     | Meaning                                                    |
 | ------------------- | ----------- | ---------------------------------------------------------- |
 | `enabled`           | `true`      | Master switch                                              |
-| `db`                | `"country"` | Legacy key from the one-database era; kept so existing configs parse, no longer affects resolution — all databases in `db_dir` are merged |
-| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`            |
-| `cache_max_entries` | `16384`     | Host→geo cache size                                        |
+| `db`                | `"country"` | Legacy key from the one-database era; kept so existing configs parse, no longer affects resolution; all databases in `db_dir` are merged |
+| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`. Under Docker Compose the shipped stack overrides this to `/shared` (the `meow-shared` volume) via `FUMOX_GEO__DB_DIR`, so `./config` on the host is **not** scanned for databases: put them in the `meow-shared` volume, or unset the override. Env outranks the file, which is why editing `db_dir` in `config/app.toml` has no effect on the Compose stack |
+| `cache_max_entries` | `16384`     | Host→geo cache size; entries also expire after 6 hours, so a host whose DNS was down is retried without a restart |
 | `dns_timeout_secs`  | `5`         | DNS resolution timeout                                     |
+| `startup_download_budget_secs` | `60` | How long startup waits for the GeoLite2 download before it starts listening. Past the budget the download keeps running in the background (the file is installed by an atomic rename, so a half-written `.mmdb` is never visible) and this run serves without geo enrichment until the next start. `0` = do not wait at all |
 
 ### `[admin]` – admin panel
 
@@ -658,7 +752,7 @@ form.
 | `allow_private_urls` | `false`            | SSRF guard: when false, source URLs may not resolve to loopback, RFC1918, link-local or cloud-metadata addresses (checked at save *and* at every fetch)                            |
 | `rate_limit`         | `"120/min"`        | Per-IP limit for admin routes                                                                                                                                                        |
 | `login_rate_limit`   | `"5/min"`          | Per-IP limit for the login form                                                                                                                                                      |
-| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy. Plain-HTTP deployments must keep it `false` — browsers silently drop `Secure` cookies on `http://`, which looks like a successful login (`admin logged in` in logs) followed by a permanent redirect to `/admin/login`. Override per-deploy with `FUMOX_ADMIN__SECURE_COOKIES=true` in `.env` (env wins over the file). |
+| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy. Plain-HTTP deployments must keep it `false`: browsers silently drop `Secure` cookies on `http://`, which looks like a successful login (`admin logged in` in logs) followed by a permanent redirect to `/admin/login`. Note the split default: `config/app.toml` ships `false`, but `docker-compose.yml` defaults `FUMOX_ADMIN__SECURE_COOKIES` to `true` (presuming an HTTPS front), so a plain-HTTP compose deployment must set it to `false` in `.env` (env wins over the file). |
 | `trust_proxy_ips`    | `[]`               | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the admin per-IP rate-limit and rendered URL scheme. Empty = never trust forwarded headers                   |
 | `allowed_hosts`      | `[]`               | Hostnames / IPs allowed to reach the admin listener. Empty = accept any `Host` value. Set this when serving the admin from a fixed domain name (e.g. reverse-proxied to `fumox.local`) |
 | `locales_dir`        | `"locales"`        | Directory with UI translation catalogs (`<code>.toml`)                                                                                                                               |
@@ -690,6 +784,7 @@ form.
 | `timeout_secs`         | `10`                                                                                    | Per-check timeout                                                                                                                                                                                                                                                                                                                 |
 | `backoff_initial_secs` | `60`                                                                                    | Initial T2 backoff while meow-rs is unavailable (doubles per consecutive failure)                                                                                                                                                                                                                                                 |
 | `backoff_max_secs`     | `900`                                                                                   | T2 backoff ceiling (15 min); a dead meow-rs is never mistaken for dead proxies                                                                                                                                                                                                                                                   |
+| `ipv6`                 | `false`                                                                                  | Rendered into the generated meow config as `ipv6`. meow-rs **0.22.0 made this key effective end-to-end**: under `false` it skips AAAA lookups and its direct outbound answers IPv4-only, where 0.21.x resolved both families whatever the key said. Only the *test URL* host goes through the resolver here: proxy servers are pinned to a vetted IP literal by the generator: so change it solely on IPv6-only egress or an AAAA-only test URL. Default matches meow-rs |
 
 ### `[retention]` – history rotation
 
@@ -749,14 +844,14 @@ deduplicate by fingerprint". `"version": 1` is required.
 
 | Section  | What it does                                                 | Fields and defaults                                                                                                                |
 | -------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `filter` | Keep/drop protocols and AS numbers; drop proxies allowing insecure TLS | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null, matched against the stored `geo_asn`, the allowlist drops proxies whose ASN was never resolved (both `"24940"` and `"AS24940"` spellings work); `forbid_insecure`: default `true`, drops any proxy with a truthy `insecure`/`allowInsecure`/`skip-cert-verify`/`allow_insecure` toggle (the old `normalize_params` name is still accepted) |
-| `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` default, `host`, `port`, `param:KEY`); rules are OR-ed; default `[]`        |
+| `filter` | Keep/drop protocols and AS numbers; drop proxies allowing insecure TLS | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null, matched against the stored `geo_asn`; a row that carries none is resolved once at serving time (the lookup is cached, and geo-enrich asks for the same host moments later), so only a host that genuinely cannot be resolved stays unknown: the allowlist drops it, an exclude list keeps it (both `"24940"` and `"AS24940"` spellings work); `forbid_insecure`: default `true`, drops any proxy with a truthy `insecure`/`allowInsecure`/`skip-cert-verify`/`allow_insecure` toggle (the old `normalize_params` name is still accepted) |
+| `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` default, `host`, `port`, `param:KEY`, `asn`); an `asn` rule takes no `match`/`flags` and instead requires a non-empty per-rule `asns` list (`"24940"` and `"AS24940"` both work) matched against the proxy's resolved AS number; rules are OR-ed; default `[]` |
 | `rename` | Regex-based rewriting, rules applied in order                | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` default, `host`, `port`, `param:KEY`); default `[]` |
 | `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment))   |
 | `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`                                                                            |
 | `dedup`  | Deduplication                                                | `by`: only `"fingerprint"` in v1                                                                                                   |
 | `sort`   | Output ordering                                              | `by`: `source` \| `name` \| `country` \| `latency` (null latencies go last); `desc`: default `false`                               |
-| `limit`  | Cap the output size                                          | `count`: integer ≥ 1, keep at most this many proxies of the final, deduplicated and sorted list (its top); `null`/omitted = no cap |
+| `limit`  | Cap the output size                                          | `count`: integer ≥ 1, on a source at most this many of that source's own proxies before the merge with the profile's other sources; on a profile, at most this many proxies of the final, deduplicated and sorted list (its top). A source's cap does not limit a multi-source profile: it serves each source's top up to that count, i.e. more than `count` proxies in total; `null`/omitted = no cap |
 
 Validation is strict: unknown keys, a non-compiling regex or an invalid enum
 value are rejected with a field error in the admin form; nothing is saved.
@@ -782,7 +877,12 @@ matching proxy is thrown away entirely: it never appears in the
 subscription, because it is never written to the database in the first place. The
 rules use the same selectors as rename (`match`, `flags`, `target`; no
 `replace`, the strict schema rejects it) and are OR-ed: a single match
-discards the proxy. They are applied twice, always before `rename` so both
+discards the proxy. The `asn` target is the exception to the regex
+selectors: it takes no `match`/`flags` (the strict schema rejects them) and
+instead requires a non-empty per-rule `asns` list (both `"24940"` and
+`"AS24940"` spellings work), discarding every proxy whose resolved AS
+number is in the list; a proxy whose ASN was never resolved matches
+nothing. They are applied twice, always before `rename` so both
 sides see the original values: at ingestion by the source's own pipeline
 (a matching proxy is not stored, geo-resolved or queued for probing; a
 corrupted config fails closed as a parse error, and if every proxy matches,
@@ -805,7 +905,8 @@ The `fumox-probe` daemon runs an endless cycle (default: every 60 s), each
 cycle in four passes:
 
 1. **Quarantine dues**: second chances and recheck-ladder steps whose moment
-   has arrived;
+   has arrived (quarantined hysteria2 is re-checked through the T2 tunnel,
+   see below);
 2. **Priority queue**: freshly inserted proxies the server queued at source
    refresh time (up to `[ingest].refresh_check_limit` per refresh), drained
    newest first, then removed from the queue before the checks run;
@@ -831,12 +932,16 @@ are never queued (they could not be checked anyway), and a proxy that leaves
 | Level            | What it proves                                               | Applies to                                  |
 | ---------------- | ------------------------------------------------------------ | ------------------------------------------- |
 | **T1** (TCP/TLS) | The server is reachable at `host:port`                       | vless, vmess, trojan, ss, socks5, naive     |
-| **T2** (tunnel)  | The proxy *actually works*: credentials valid, traffic flows | vless, vmess, trojan, ss, hysteria2, socks5 |
+| **T2** (tunnel)  | The proxy *actually works*: credentials valid, traffic flows | vless, vmess, trojan, ss, hysteria2, socks5, snell, anytls |
 
 QUIC protocols (hysteria2, tuic) skip T1: a TCP connect to a UDP port proves
 nothing. **hysteria2** is not hurt by that: a fresh `unknown` hysteria2 goes
 straight into the T2 sample and from there follows the regular state machine
-(the failure counter is shared with T1). **tuic and mieru are unprobeable**
+(the failure counter is shared with T1). The T2 path stays open in quarantine:
+a quarantined hysteria2 is revived by a real tunnel check through meow-rs
+rather than a TCP connect that cannot succeed: success returns the row to
+the `ready` tier with a clean slate, and a failed tunnel check advances the
+same recheck ladder as any other scheme. **tuic and mieru are unprobeable**
 altogether (meow-rs doesn't support them): they keep status `unknown` forever,
 always pass health filters, and are badged "unprobeable" in the admin panel.
 Exclude them with `filter.protocols` if you don't want them in a profile.
@@ -855,6 +960,10 @@ stateDiagram-v2
         hysteria2 skips T1
         and goes straight to T2
     end note
+    note right of quarantine
+        quarantined hysteria2
+        revives via a T2 tunnel check
+    end note
 ```
 
 The rules in plain language:
@@ -871,12 +980,18 @@ The rules in plain language:
 - **Second chance.** At a random moment of the **[12 h, 16 h)** window after
   quarantine (`quarantined_at + second_chance_min_hours +
   U(0..second_chance_spread_hours)`, UTC, drawn once and stored) the proxy is
-  re-checked. Success → back to `alive`. The second chance and the ladder
-  steps are T1 checks: a quarantined proxy no longer enters the T2 sample.
+  re-checked. Success → back to `alive`. For every scheme except hysteria2
+  the second chance and the ladder steps are T1 checks, and a quarantined
+  proxy no longer enters the T2 sample. Quarantined hysteria2 is the one
+  exception: its second chance and ladder steps run as T2 tunnel checks
+  through meow-rs (a TCP connect cannot succeed against a QUIC port), and
+  a successful tunnel check revives it straight into `ready`.
 - **Recheck ladder.** After a failed second chance the proxy walks the ladder
   of `[probe].recheck_delays_secs` (default 15 min → 30 min → 1 h): failing
   step N schedules step N+1 after the Nth array entry; failing the last step
-  → `removed`. Any success → `alive`. The ladder length is arbitrary (up to
+  → `removed`. Any success → `alive`; for quarantined hysteria2 the
+  success comes from the T2 tunnel revival and lands in `ready`. The ladder
+  length is arbitrary (up to
   16 steps of at most 30 days); an empty list removes the proxy right after
   the failed second chance. With the defaults, the "quarantine → removed"
   path takes ~13 h 45 min – 17 h 45 min.
@@ -885,6 +1000,15 @@ The rules in plain language:
   lists it again, its state is *not* reset: reconciliation never touches the
   state machine (only the probe does). Ways back: *Reset status* on the proxy
   card, or *Purge removed* followed by the next fetch inserting it as new.
+- **Reset status only resets what the probe can pick up.** It puts the row
+  back to a pristine `unknown` and hands it to the priority queue, so it only
+  does anything for a proxy the probe will actually look at. For a row that
+  belongs to no probe lane (no link to any source left, or a scheme no lane
+  checks (`tuic`, `mieru`)), the panel says so and leaves the status exactly
+  as it is; the badge does not change. The link is what puts a row in front of
+  the probe, and reconciliation drops it on the next refresh, so re-insert the
+  proxy through a source (or *Purge removed* and let the next fetch carry it)
+  rather than pressing the button again.
 - **Disappearing from a source does not retire a live proxy (alive-linger).**
   While the probe keeps confirming a proxy (`alive`), a source refresh that no
   longer sees it keeps its link: the proxy continues its check cycle and stays
@@ -922,20 +1046,24 @@ panel's *Settings* page.
 | `[meow].backoff_initial_secs`        | `60`                | Initial T2 backoff while meow-rs is unavailable                                                                                                     |
 | `[meow].backoff_max_secs`            | `900`               | T2 backoff ceiling (15 min)                                                                                                                         |
 
-The *Settings* page renders the **complete** effective config, not just the
+The *Settings* page renders the effective config, not just the
 state machine: the table above, plus `[server]`, `[database]`, `[geo]`,
 `[admin]` and `[log]` panels (rate limits in the canonical `N/unit` form,
 response caps human-readable, the legacy `[geo].db` marked as ignored). The
-admin token is the only value that never appears on the page.
+admin token is never shown. Two keys are also absent from the page for a
+different reason; they have no rendered field at all: `[server].export_max_rows`
+and `[geo].startup_download_budget_secs`. Both apply from the file exactly as
+documented; only the panel skips them, so read their values from
+`config/app.toml`.
 
 ### Editing `config/app.toml` from the panel
 
 The overview links to `/admin/settings/edit`, a form-based editor backed by
 [`toml_edit`](https://crates.io/crates/toml_edit) that writes the file in
 place. Comments you wrote into `config/app.toml` (RU/EN pairs, banners,
-hints — every `#…` line) survive every save because the editor operates on
+hints, every `#…` line) survive every save because the editor operates on
 the parsed document, not a regenerated one. Sections are grouped by owning
-process (Server / Probe / Shared) via CSS-only `<input type="radio">` tabs —
+process (Server / Probe / Shared) via CSS-only `<input type="radio">` tabs,
 no JavaScript required.
 
 Editing is **restart-required**: the panel saves the file, but server and
@@ -946,7 +1074,7 @@ existing figment merge, so a transient ENV override is still the right
 tool for one-off adjustments.
 
 Rotating `[admin].token` or flipping `[admin].secure_cookies` invalidates
-every active session on the next request — the panel reads the new value
+every active session on the next request; the panel reads the new value
 on startup, so cookies signed under the old token stop verifying and
 existing users get signed out without notice. Plan such changes for a
 quiet window, and warn anyone who is logged in.
@@ -966,7 +1094,7 @@ The editor is intentionally narrow on safety:
   red field messages (`422`); nothing is written until every field is
   valid. `bind` changes are checked with `SocketAddr::from_str`, the
   recheck ladder is parsed as `Vec<i64>`, rate limits as `<N>/<unit>`.
-- The admin token field is a plain input — sending the empty string
+- The admin token field is a plain input; sending the empty string
   keeps the current token (used by the encrypted digest over the
   session cookie) so the panel never silently disables itself.
   Changing the token invalidates every active session the next request.
@@ -996,46 +1124,96 @@ throughput:
 
 | Knob | Effect | When to touch |
 |------|--------|--------------|
-| `[probe].sample_size` | Rows taken per cycle, before concurrency. | First lever — main throughput control. |
-| `[probe].concurrency` | Parallel checks *within* a cycle. | Only when a single cycle exceeds `cycle_interval_secs` (i.e. `(sample_size / concurrency) × (connect_timeout_secs + tls_timeout_secs) > cycle_interval_secs`). |
+| `[probe].sample_size` | Rows a cycle takes from the queue, before concurrency. | First lever, the main throughput control. |
+| `[probe].concurrency` | Parallel checks *within* a cycle. | Only when one cycle no longer fits `cycle_interval_secs`. |
 | `[probe].cycle_interval_secs` | How often a new cycle starts. | Tighten only after `sample_size` is already large. |
 
-Two formulas drive the recommendation math shown in the banner:
+The banner derives every cycle number from a single model:
 
 ```
-cycles_to_drain  = ceil(quarantine_count / sample_size)
-drain_minutes    = cycles_to_drain × cycle_interval_secs / 60
+retire_per_cycle = min(sample_size, due_count)
+lane             = ceil(retire_per_cycle / concurrency)
+                   × (connect_timeout_secs + tls_timeout_secs)
+period           = max(cycle_interval_secs, lane)
+drain_minutes    = ceil(quarantine_count / retire_per_cycle) × period / 60
 ```
+
+`due_count` is how many quarantined rows have `ladder_at` in the past.
+It is the reason a big queue is not by itself a backlog: a row
+quarantined a minute ago is not due for another 12–16 h, so no cycle can
+retire it and no setting on that page changes it.
+
+`lane` sizes the quarantine lane only, the one lane that retires queue
+rows. A cycle also awaits the queued-checks, T1 sample and T2 batch
+lanes, and the estimate deliberately does not claim their work. `period`
+takes a `max` because the daemon's ticker skips missed ticks: a lane
+longer than the interval pushes the next start out by the work.
+
+When `retire_per_cycle` is 0, usually because the second-chance window
+has not elapsed yet or because `sample_size` is 0, the cycle picks up
+nothing and there is no drain to estimate. The banner then reports what
+the cycle took and how much is due, instead of a figure it does not
+have. At `sample_size = 0` the two sample-proportional triggers stay off
+entirely: a ratio of the queue against a zero sample says nothing.
+
+Two assumptions the figure rests on:
+
+- it assumes every due row *passes* and leaves quarantine. A failed
+  recheck is re-stamped by `recheck_delays_secs` and stays in the queue,
+  so on a sick queue the real drain is slower than the modelled one;
+- a recommendation is the smallest change the model can certify as an
+  improvement, not a promise to hit the target.
 
 If `drain_minutes` exceeds `[probe].backlog_target_drain_minutes`
-(default 60), the banner suggests:
+(default 60), the banner suggests values; each one is offered only when it
+can be shown to help, and evaluated in sequence so the whole set is consistent when
+applied together:
 
-- a new `sample_size = ceil(quarantine_count × cycle_interval_secs / (target_minutes × 60))`, capped at 500;
-- if the required sample would exceed 500, a shorter `cycle_interval_secs = max(5, target_minutes × 60 / cycles_to_drain)`;
-- if `current_cycle_secs > cycle_interval_secs`, a `concurrency = ceil(sample_size × (connect_timeout_secs + tls_timeout_secs) / cycle_interval_secs)`, capped at 64.
+- `sample_size`, capped at both 500 and the number of rows actually due
+  (a larger sample would retire exactly as many rows), and only when
+  `due_count > sample_size` plus a 20 % margin over the current value;
+- `concurrency`, only when the modelled lane exceeds the interval; the
+  value is the smallest `c ≤ 64` that brings the lane back inside it
+  **at the sample size in effect, or the one just recommended**: the
+  two recommendations are chained, so applying both keeps the cycle on
+  schedule;
+- `cycle_interval_secs`, only when the shortened period still fits the
+  modelled lane, and never below 5 s, the same floor the daemon puts on
+  its own beat period, so the banner never advises running the cycle
+  faster than the cadence it considers sane.
 
 **What does not help with backlog.** `fail_limit`, `recheck_delays_secs`,
 `second_chance_min_hours`, `second_chance_spread_hours`,
 `queue_stale_days`, and the `[meow]` backoff are all about *inflow*
-or external services — they cannot drain an existing queue faster.
+or external services; they cannot drain an existing queue faster.
 They are still useful for keeping new failures from piling up, but
 treat them as inflow controls, not throughput controls.
 
 **Worked example.** With defaults (`sample_size = 50`, `cycle_interval_secs = 60`,
-`concurrency = 8`, `target = 60 min`):
+`concurrency = 8`, `connect_timeout_secs + tls_timeout_secs = 20 s`,
+`target = 60 min`) and every row due:
 
-| `quarantine_count` | cycles | drain | banner |
-|--------------------|-------:|------:|--------|
-| 800  | 16  |  16 min | silent |
-| 4 000 |  80 |  80 min | warning + `sample_size = 67` |
-| 10 000 | 200 | 200 min | warning + `sample_size = 167` |
-| 100 000 | 2 000 | 33 h | warning + `sample_size = 500` (capped) + `cycle_interval_secs = 18s` |
+| quarantined | retire/cycle | period | drain | banner |
+|------------:|-------------:|-------:|------:|--------|
+| 800 | 50 | 140 s | 38 min | warning: `due_overflow`; the drain fits the target, so no recommendations |
+| 4 000 | 50 | 140 s | 187 min | warning + `sample_size = 156` + `concurrency = 52` |
+| 10 000 | 50 | 140 s | 467 min | warning + `sample_size = 389`, no concurrency rec, even at 64 the 389-row lane needs 980 s |
+| 100 000 | 50 | 140 s | 4 667 min | warning + `sample_size = 500` (capped), no concurrency rec, likewise |
 
-Tightening `backlog_target_drain_minutes` to 15 in the last row makes
-the recommended `sample_size` jump to 500 (still capped) and the
-recommended `cycle_interval_secs` to 5 s (still floored) — i.e. the
-banner's `sample_size` only scales so far before you also have to
-shorten the cycle.
+At `backlog_target_drain_minutes = 15` the 4 000-row queue asks for the
+500 cap and still lands at 168 min. With a 20 s worst case per check,
+throughput tops out at `concurrency / check` rows per second, so a
+tighter target is a throughput limit, not something scheduling can fix.
+
+**Two rules worth knowing.** The daemon card and the backlog banner both
+call a heartbeat dead after `max(period, 5) × 3`, where the period is
+the one the daemon reports in its own heartbeat (a record from before
+that field existed falls back to this server's
+`heartbeat_interval_secs`), so a server and a probe reading different
+config files still agree on the daemon's own schedule. The `.max(5)`
+mirrors the daemon's own beat floor, so configuring a period below 5 s
+cannot make a healthy daemon look dead. And `queue_stale_days = 0`
+behaves as 1 in the banner, exactly as in the daemon's retention.
 
 ## 11. Geo enrichment
 
@@ -1049,8 +1227,15 @@ Manual installation (e.g. with your own MaxMind license) goes like this:
 1. Register a free account at <https://www.maxmind.com/en/geolite2/signup>.
 2. Download the database you need via
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/).
-3. Place the file into `[geo].db_dir` (default `config/`) under its canonical
-   name: `GeoLite2-City.mmdb` or `GeoLite2-ASN.mmdb`.
+3. Place the file into `[geo].db_dir` under its canonical name:
+   `GeoLite2-City.mmdb` or `GeoLite2-ASN.mmdb`. The default is `config/` next
+   to the binary, which is the host's `./config` under Compose, **but the
+   shipped Compose stack overrides `[geo].db_dir` to `/shared`**, so a file
+   dropped in `./config` is never read there. Under Compose, put the `.mmdb`
+   into the `meow-shared` volume (`/shared`), or drop the `FUMOX_GEO__DB_DIR`
+   override from `docker-compose.yml` and set `[geo].db_dir` in the file.
+   You can skip this step entirely: Fumox downloads the databases itself
+   (see below), and under Compose that download already targets `/shared`.
 
 Fumox opens **every** database it finds in `[geo].db_dir` and merges their
 facts, so country, city and ASN data combine in one name template. The
@@ -1061,10 +1246,13 @@ everything else keeps working. MaxMind updates their databases weekly.
 
 Fumox fetches the databases itself: at startup the server checks
 `[geo].db_dir` and downloads any GeoLite2 database that is missing, broken
-or older than a month from a public release mirror.
+or older than a month from a public release mirror. It waits at most
+`[geo].startup_download_budget_secs` (60 s) for that to finish before it
+starts serving; a slower mirror does not keep the service down: the
+download carries on in the background and takes effect on the next start.
 
 **Name templates.** The `geo.template` pipeline setting (default
-`"{flag} {country} · {name}"`) supports these placeholders — all of them
+`"{flag} {country} · {name}"`) supports these placeholders; all of them
 work in one template at the same time, each drawing on its own database:
 
 | Placeholder | Meaning                               | Data source              |
@@ -1127,19 +1315,43 @@ stored.
       `[admin].allowed_hosts` to the hostname the proxy serves (e.g.
       `["fumox.example.com"]`). Without it, the `Host` header is
       honored as-is for the alive/ready export token URLs and the
-      rendered admin URLs — an attacker who can poison the `Host`
+      rendered admin URLs, so an attacker who can poison the `Host`
       header reaching the listener can make the admin render URLs
       pointing at attacker-controlled hosts and steal the capability
       token. Set this on every deployment served from a fixed hostname.
-- [ ] `allow_private_urls` left `false` (SSRF protection), unless you have a
-      specific trusted-internal-source reason.
+      If the panel is reached on a *different* host than the public
+      listener serves (loopback is the Compose default), add that host to
+      `[server].allowed_hosts` too: the export link on *Import /
+      Export*, *Sources* and *Profiles* is built from the host you
+      reached the panel on, and the public listener answers `404` for a
+      host it does not serve. Those three screens themselves render.
+- [ ] **Behind a reverse proxy:** the proxy forwards the original `Host`
+      header unchanged (nginx: `proxy_set_header Host $host;`, which the
+      shipped `docker/nginx/` example already does). The admin panel
+      rejects requests it classifies as cross-site with `403`
+      (`err.cross_site`) before auth, CSRF and rate limiting:
+      `Sec-Fetch-Site: cross-site` (top-level navigations to `/admin`
+      are exempt), `Origin: null`, or an `Origin` whose host:port does
+      not match `Host`. Browsers on the panel's own origin and
+      header-less clients are unaffected; a proxy that rewrites `Host`,
+      or a non-browser integration that POSTs with a foreign `Origin`
+      header, gets `403` where it used to be processed.
+- [ ] `allow_private_urls` set to `false` (the built-in default, SSRF
+      protection). The shipped `config/app.toml` example sets it to `true`,
+      so change it unless you have a specific trusted-internal-source
+      reason. `[probe].allow_private_targets` needs no such check: this
+      example ships `false` like its built-in default, and `true` is an
+      explicit opt-in for isolated test infrastructure.
 - [ ] One `fumox-server` + one `fumox-probe` against the same database file;
       `busy_timeout_ms` stays set.
 - [ ] meow-rs runs as its own long-lived service (systemd unit / container
       with restart policy) with its REST API at `[meow].api_addr`;
       `[meow].config_path` is readable by the meow-rs process.
 - [ ] `[meow].test_url` is reachable from your proxies' networks.
-- [ ] GeoLite2 database downloaded into `[geo].db_dir` (if you want geo names).
+- [ ] Geo enrichment works: the server downloads the GeoLite2 databases into
+      `[geo].db_dir` itself, provided the directory is writable (under Compose
+      that is `/shared`, not `./config`); check that names carry flags
+      and countries if you want geo names.
 - [ ] Regular DB backups via `sqlite3 ".backup"`.
 - [ ] Process supervision with automatic restart (`systemd`, Docker
       `restart: unless-stopped`, etc.). Both binaries shut down gracefully on
@@ -1176,7 +1388,9 @@ WantedBy=multi-user.target
 | `X-Fumox-Stale: true` header                                          | Some sources are temporarily unreachable; last good data is being served. The fetch log shows which sources and why (`error_class`).               |
 | Source shows `parse_error`                                            | The source returned HTTP 200 but unparseable content (anti-bot page, CDN stub, format change). The last good snapshot is served meanwhile.         |
 | Source won't save: "private URL" error                                | The URL resolves to a loopback/private address and `allow_private_urls` is false. That's the SSRF guard working.                                   |
-| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`.                                                                      |
+| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`. Under Compose the directory is `/shared`, not `./config`, see [section 11](#11-geo-enrichment).    |
+| *Import / Export*, *Sources* or *Profiles*: export link 404s         | The link is built from the panel's host; the public listener answers `404` for a host it does not serve. Add it to `[server].allowed_hosts`.     |
+| GeoLite2 file placed in `./config` is ignored                          | The Compose stack sets `FUMOX_GEO__DB_DIR=/shared`, and the environment outranks `config/app.toml`. Use the `meow-shared` volume, or remove the override and set `[geo].db_dir`. |
 | T2 checks never run, probe logs mention meow backoff                  | meow-rs is down or `[meow].api_addr` is wrong. In Docker, it must be `meow:9090`; the config path must be the shared volume (`/shared/meow.yaml`). |
 | `SQLITE_BUSY` errors in logs                                          | `busy_timeout_ms` was removed or set too low while two processes write to the DB. Restore the default (5000).                                      |
 | Build fails: `sqlite3.h: No such file`                                | Install the system SQLite dev package (`libsqlite3-dev` on Debian/Ubuntu).                                                                         |
@@ -1186,5 +1400,5 @@ WantedBy=multi-user.target
 
 | Document                                                      | Contents                                          |
 | ------------------------------------------------------------- | ------------------------------------------------- |
-| [`README.md`](./README.md) / [`README.ru.md`](./README.ru.md) | Project overview, name story, minimal quick start |
+| [`README.md`](./README.md) / [`README.ru.md`](./README.ru.md) | Project overview, minimal quick start                      |
 | [`config/app.toml`](./config/app.toml)                        | Annotated reference configuration                 |

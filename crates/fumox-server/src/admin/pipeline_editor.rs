@@ -1,14 +1,18 @@
 //! Pipeline builder state: the server-side half of the admin
-//! pipeline editor. `BuilderState` mirrors the widget's form fields; [`emit`]
-//! generates the pipeline JSON (validator semantics, only non-default values)
-//! and [`ingest`] rebuilds the state from a stored JSON or reports "raw
+//! pipeline editor. `BuilderState` mirrors the widget's form fields;
+//! [`BuilderState::emit`] generates the pipeline JSON (validator semantics,
+//! only non-default values) and [`BuilderState::ingest`] rebuilds the state
+//! from a stored JSON or reports "raw
 //! mode". The schema registry (`Schema`) sources every option list from the
 //! validator's own enums, so the builder can never offer a value the
 //! validator rejects out of hand. The widget itself (modes, presets,
 //! preview) renders through [`WidgetFragment`] into the source/profile forms.
 
 use crate::admin::i18n::{Lang, impl_i18n};
-use crate::pipeline::{DEFAULT_GEO_TEMPLATE, DropRule, PipelineConfig, RenameRule, SortBy};
+use crate::pipeline::{
+    DEFAULT_GEO_TEMPLATE, DropRule, FilterConfig, GeoStepConfig, HealthConfig, LimitConfig,
+    PipelineConfig, RenameRule, SortBy, SortConfig,
+};
 use askama::Template;
 use fumox_core::models::{ProxyStatus, Scheme};
 
@@ -17,7 +21,7 @@ use fumox_core::models::{ProxyStatus, Scheme};
 /// `target` mirrors the rule's `target` field in the compact UI form:
 /// `"name"`/`"host"`/`"port"` or `"param:KEY"`. The `param` key part is a
 /// separate free-text field in the widget (`_rows.html`), so `target`
-/// holds `"param"` and `param_key` the key; [`emit_rename_rule`] recombines
+/// holds `"param"` and `param_key` the key; [`emit_rename_target`] recombines
 /// them. Keeping them split avoids a regex round-trip between the form and
 /// the state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,7 +35,7 @@ pub(crate) struct RenameRow {
 
 /// The rule's `target` JSON value: the compact UI form recombined. An
 /// unknown selector or an empty `param` key is emitted as-is (a `param:`
-/// with nothing after the colon) — the builder holds values the validator
+/// with nothing after the colon), the builder holds values the validator
 /// will flag in the preview, never silently dropping them.
 /// `name` emits nothing: it is the schema default and stays implicit.
 pub(crate) fn emit_rename_target(row: &RenameRow) -> Option<String> {
@@ -44,7 +48,7 @@ pub(crate) fn emit_rename_target(row: &RenameRow) -> Option<String> {
 
 /// One drop row of the builder (a `drop[]` entry). The selector twin of a
 /// rename row minus the replacement: the same target select (`name`/
-/// `host`/`port`/`param` plus the key field), no `replace` — a discard
+/// `host`/`port`/`param` plus the key field), no `replace`, a discard
 /// rule only selects, never rewrites.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DropRow {
@@ -54,12 +58,12 @@ pub(crate) struct DropRow {
     pub param_key: String,
     /// AS numbers for `target: "asn"`. Free-text comma-separated input;
     /// the validator parses and the JSON section emits an array. Empty
-    /// outside the ASN target — ASN rules carry no `match` field.
+    /// outside the ASN target, ASN rules carry no `match` field.
     pub asns: String,
 }
 
 impl DropRow {
-    /// The rule's `target` JSON value — the same recombination semantics
+    /// The rule's `target` JSON value, the same recombination semantics
     /// as [`emit_rename_target`], with an extra `asn` literal that
     /// signals the ASN-list branch (no `param:` prefix).
     fn target_value(&self) -> Option<String> {
@@ -72,13 +76,14 @@ impl DropRow {
 }
 
 /// Values of the builder widget, exactly as the form fields carry them.
-/// Section toggles (`*_set`) express the administrator's intent; [`emit`]
+/// Section toggles (`*_set`) express the administrator's intent;
+/// [`BuilderState::emit`]
 /// turns a set section into JSON only when it holds at least one value that
 /// differs from the defaults.
 ///
 /// The `*_defaults` flags are the profile tri-state: a
 /// profile section replaces the source's section wholesale, so besides "not
-/// set" (inherit the source's rule) and "set" there is "explicit defaults" —
+/// set" (inherit the source's rule) and "set" there is "explicit defaults" ,
 /// an empty section that resets the source's rule to the built-in defaults.
 /// `rename_skip` is the "not set" choice for rename, whose only state
 /// besides the rules themselves is the empty `[]`.
@@ -100,14 +105,15 @@ pub(crate) struct BuilderState {
     pub rename: Vec<RenameRow>,
     pub rename_skip: bool,
     pub rename_defaults: bool,
-    /// The `drop` section — the same tri-state as rename, over `DropRow`s.
+    /// The `drop` section, the same tri-state as rename, over `DropRow`s.
     pub drop: Vec<DropRow>,
     pub drop_skip: bool,
     pub drop_defaults: bool,
     pub geo_set: bool,
     pub geo_defaults: bool,
     pub geo_enabled: bool,
-    /// Empty means the built-in default template (never emitted, see [`emit`]).
+    /// Empty means the built-in default template (never emitted, see
+    /// [`BuilderState::emit`]).
     pub geo_template: String,
     pub health_set: bool,
     pub health_defaults: bool,
@@ -117,7 +123,7 @@ pub(crate) struct BuilderState {
     /// Empty or `"source"` is the default (never emitted).
     pub sort_by: String,
     pub sort_desc: bool,
-    /// The `limit` section — the same tri-state as sort, over a single
+    /// The `limit` section, the same tri-state as sort, over a single
     /// number field (the output-size cap).
     pub limit_set: bool,
     pub limit_defaults: bool,
@@ -288,85 +294,92 @@ impl BuilderState {
 
     /// Generate the pipeline JSON: `version` 1 plus only the
     /// values that differ from the defaults. A set section with no
-    /// non-default value emits nothing — the preview shows the administrator
+    /// non-default value emits nothing, the preview shows the administrator
     /// the resulting (NULL) configuration, and forcing explicit defaults is
     /// what the `*_defaults` mode is for. `None` means "nothing configured":
     /// the field stores NULL (pass-through defaults), never `{}`.
+    ///
+    /// The sections are built as a typed [`PipelineConfig`] and serialized
+    /// through its `Serialize` side, which carries the omit-defaults
+    /// policy (`skip_serializing_if` per field), so the emitted keys are
+    /// the schema's own and a new schema field cannot be missed here
+    /// without a compile error at the struct literals below.
     pub(crate) fn emit(&self) -> Option<serde_json::Value> {
-        let mut map = serde_json::Map::new();
-        map.insert("version".into(), serde_json::Value::from(1));
+        let mut config = PipelineConfig {
+            version: 1,
+            filter: None,
+            rename: None,
+            drop: None,
+            geo: None,
+            health: None,
+            dedup: None,
+            sort: None,
+            limit: None,
+        };
 
         if self.filter_defaults {
-            map.insert(
-                "filter".into(),
-                serde_json::Value::Object(Default::default()),
-            );
+            // An explicit `{}`: a profile resets the source's filter.
+            config.filter = Some(FilterConfig {
+                protocols: None,
+                exclude_protocols: None,
+                asns: None,
+                exclude_asns: None,
+                forbid_insecure: true,
+            });
         } else if self.filter_set {
-            let mut filter = serde_json::Map::new();
-            if !self.protocols.is_empty() {
-                filter.insert("protocols".into(), strings(&self.protocols));
-            }
-            if !self.exclude_protocols.is_empty() {
-                filter.insert("exclude_protocols".into(), strings(&self.exclude_protocols));
-            }
-            if let Some(asns) = split_asn_field(&self.asns) {
-                filter.insert("asns".into(), strings(&asns));
-            }
-            if let Some(exclude) = split_asn_field(&self.exclude_asns) {
-                filter.insert("exclude_asns".into(), strings(&exclude));
-            }
-            if !self.forbid_insecure {
-                filter.insert("forbid_insecure".into(), serde_json::Value::from(false));
-            }
-            if !filter.is_empty() {
-                map.insert("filter".into(), filter.into());
+            let asns = split_asn_field(&self.asns);
+            let exclude_asns = split_asn_field(&self.exclude_asns);
+            let has_values = !self.protocols.is_empty()
+                || !self.exclude_protocols.is_empty()
+                || asns.is_some()
+                || exclude_asns.is_some()
+                || !self.forbid_insecure;
+            if has_values {
+                // Empty lists are "not set" for the emit (the schema's
+                // `Option`s stay `None`), only non-empty ones are written.
+                config.filter = Some(FilterConfig {
+                    protocols: (!self.protocols.is_empty()).then(|| self.protocols.clone()),
+                    exclude_protocols: (!self.exclude_protocols.is_empty())
+                        .then(|| self.exclude_protocols.clone()),
+                    asns,
+                    exclude_asns,
+                    forbid_insecure: self.forbid_insecure,
+                });
             }
         }
 
         if self.rename_defaults {
             // An explicit `[]`: a profile resets the source's rename rules.
-            map.insert("rename".into(), serde_json::Value::Array(Vec::new()));
+            config.rename = Some(Vec::new());
         } else if !self.rename_skip {
             // Empty rows (no `match`) are work-in-progress lines of the
             // widget and never reach the JSON.
-            let rules: Vec<serde_json::Value> = self
+            let rules: Vec<RenameRule> = self
                 .rename
                 .iter()
                 .filter(|row| !row.match_pattern.is_empty())
-                .map(|row| {
-                    let mut rule = serde_json::Map::new();
-                    rule.insert(
-                        "match".into(),
-                        serde_json::Value::from(row.match_pattern.as_str()),
-                    );
-                    rule.insert(
-                        "replace".into(),
-                        serde_json::Value::from(row.replace.as_str()),
-                    );
-                    if !row.flags.is_empty() {
-                        rule.insert("flags".into(), serde_json::Value::from(row.flags.as_str()));
-                    }
-                    if let Some(target) = emit_rename_target(row) {
-                        rule.insert("target".into(), serde_json::Value::from(target));
-                    }
-                    serde_json::Value::Object(rule)
+                .map(|row| RenameRule {
+                    match_pattern: row.match_pattern.clone(),
+                    replace: row.replace.clone(),
+                    flags: row.flags.clone(),
+                    target: emit_rename_target(row),
                 })
                 .collect();
             if !rules.is_empty() {
-                map.insert("rename".into(), serde_json::Value::Array(rules));
+                config.rename = Some(rules);
             }
         }
 
         if self.drop_defaults {
             // An explicit `[]`: a profile resets the source's drop rules.
-            map.insert("drop".into(), serde_json::Value::Array(Vec::new()));
+            config.drop = Some(Vec::new());
         } else if !self.drop_skip {
             // Two flavours per row:
             //  * `target == "asn"` → ASN-list rule (no `match`).
             //  * any other target → regex rule with optional `match` /
             //    `flags`. The "work-in-progress" filter is on `match` for
             //    regex rows and on `asns` for ASN rows.
-            let rules: Vec<serde_json::Value> = self
+            let rules: Vec<DropRule> = self
                 .drop
                 .iter()
                 .filter(|row| {
@@ -378,113 +391,125 @@ impl BuilderState {
                 })
                 .map(|row| {
                     if row.target.trim() == "asn" {
-                        let asns: Vec<serde_json::Value> = row
-                            .asns
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(serde_json::Value::from)
-                            .collect();
-                        serde_json::json!({ "target": "asn", "asns": asns })
+                        DropRule {
+                            match_pattern: String::new(),
+                            flags: String::new(),
+                            target: Some("asn".to_string()),
+                            asns: Some(
+                                row.asns
+                                    .split(',')
+                                    .map(|value| value.trim().to_string())
+                                    .filter(|value| !value.is_empty())
+                                    .collect(),
+                            ),
+                        }
                     } else {
-                        let mut rule = serde_json::Map::new();
-                        rule.insert(
-                            "match".into(),
-                            serde_json::Value::from(row.match_pattern.as_str()),
-                        );
-                        if !row.flags.is_empty() {
-                            rule.insert(
-                                "flags".into(),
-                                serde_json::Value::from(row.flags.as_str()),
-                            );
+                        DropRule {
+                            match_pattern: row.match_pattern.clone(),
+                            flags: row.flags.clone(),
+                            target: row.target_value(),
+                            asns: None,
                         }
-                        if let Some(target) = row.target_value() {
-                            rule.insert("target".into(), serde_json::Value::from(target));
-                        }
-                        serde_json::Value::Object(rule)
                     }
                 })
                 .collect();
             if !rules.is_empty() {
-                map.insert("drop".into(), serde_json::Value::Array(rules));
+                config.drop = Some(rules);
             }
         }
 
         if self.geo_defaults {
-            map.insert("geo".into(), serde_json::Value::Object(Default::default()));
+            // An explicit `{}`: a profile resets the source's geo step.
+            config.geo = Some(GeoStepConfig {
+                enabled: true,
+                template: DEFAULT_GEO_TEMPLATE.to_string(),
+            });
         } else if self.geo_set {
-            let mut geo = serde_json::Map::new();
-            if !self.geo_enabled {
-                geo.insert("enabled".into(), serde_json::Value::from(false));
-            }
             let template = self.geo_template.trim();
-            if !template.is_empty() && template != DEFAULT_GEO_TEMPLATE {
-                geo.insert("template".into(), serde_json::Value::from(template));
-            }
-            if !geo.is_empty() {
-                map.insert("geo".into(), geo.into());
+            let has_values =
+                !self.geo_enabled || (!template.is_empty() && template != DEFAULT_GEO_TEMPLATE);
+            if has_values {
+                // The built-in default template is shown as the empty value:
+                // the field's placeholder carries it and the schema's
+                // serializer never writes it out.
+                config.geo = Some(GeoStepConfig {
+                    enabled: self.geo_enabled,
+                    template: if !template.is_empty() && template != DEFAULT_GEO_TEMPLATE {
+                        template.to_string()
+                    } else {
+                        DEFAULT_GEO_TEMPLATE.to_string()
+                    },
+                });
             }
         }
 
         if self.health_defaults {
-            map.insert(
-                "health".into(),
-                serde_json::Value::Object(Default::default()),
-            );
+            // An explicit `{}`: a profile resets the source's health
+            // filter, so the section is built with the default exclusion
+            // list (which the schema's serializer omits).
+            config.health = Some(HealthConfig {
+                exclude_statuses: crate::pipeline::default_exclude_statuses(),
+            });
         } else if self.health_set
             && self.exclude_statuses != crate::pipeline::default_exclude_statuses()
         {
-            map.insert(
-                "health".into(),
-                serde_json::json!({ "exclude_statuses": self.exclude_statuses }),
-            );
+            config.health = Some(HealthConfig {
+                exclude_statuses: self.exclude_statuses.clone(),
+            });
         }
 
         if self.sort_defaults {
-            map.insert("sort".into(), serde_json::Value::Object(Default::default()));
+            // An explicit `{}`: a profile resets the source's sort.
+            config.sort = Some(SortConfig {
+                by: SortBy::Source,
+                desc: false,
+            });
         } else if self.sort_set {
-            let mut sort = serde_json::Map::new();
             let by = SortBy::ALL
                 .iter()
                 .find(|sort| sort.as_str() == self.sort_by)
                 .copied();
-            if let Some(by) = by
-                && by != SortBy::Source
-            {
-                sort.insert("by".into(), serde_json::Value::from(by.as_str()));
-            }
-            if self.sort_desc {
-                sort.insert("desc".into(), serde_json::Value::from(true));
-            }
-            if !sort.is_empty() {
-                map.insert("sort".into(), sort.into());
+            if by.is_some_and(|by| by != SortBy::Source) || self.sort_desc {
+                config.sort = Some(SortConfig {
+                    by: by
+                        .filter(|by| *by != SortBy::Source)
+                        .unwrap_or(SortBy::Source),
+                    desc: self.sort_desc,
+                });
             }
         }
 
+        // The one value the typed schema cannot hold: a mistyped cap
+        // rides along as a JSON string so the validator reports it on the
+        // panel language instead of the field silently disappearing. That
+        // output is deliberately not a valid v1 config, so it cannot
+        // travel inside `LimitConfig` (whose `count` is `Option<i64>`) and
+        // is patched into the serialized document below.
+        let mut mistyped_limit: Option<String> = None;
         if self.limit_defaults {
             // An explicit `null` cap: a profile resets the source's limit
             // back to "no cap" (the same reset semantics as an empty
             // rename/drop array).
-            map.insert("limit".into(), serde_json::json!({ "count": null }));
+            config.limit = Some(LimitConfig { count: None });
         } else if self.limit_set {
             let raw = self.limit_count.trim();
             if !raw.is_empty() {
-                // A valid number is written as a number; a mistyped entry
-                // rides along as a string so the validator reports it on
-                // the panel language instead of the field silently
-                // disappearing.
-                let value = match raw.parse::<i64>() {
-                    Ok(count) => serde_json::Value::from(count),
-                    Err(_) => serde_json::Value::from(raw),
-                };
-                map.insert("limit".into(), serde_json::json!({ "count": value }));
+                match raw.parse::<i64>() {
+                    Ok(count) => config.limit = Some(LimitConfig { count: Some(count) }),
+                    Err(_) => mistyped_limit = Some(raw.to_string()),
+                }
             }
         }
 
-        if map.len() == 1 {
-            None // only "version" — nothing configured
+        let mut value =
+            serde_json::to_value(&config).expect("pipeline v1 config always serializes");
+        if let Some(raw) = mistyped_limit {
+            value["limit"] = serde_json::json!({ "count": raw });
+        }
+        if value.as_object().is_some_and(|map| map.len() == 1) {
+            None // only "version", nothing configured
         } else {
-            Some(serde_json::Value::Object(map))
+            Some(value)
         }
     }
 
@@ -510,7 +535,7 @@ pub(crate) enum Ingest {
     /// The stored pipeline is fully representable by the builder fields.
     Builder(Box<BuilderState>),
     /// Structural parse failed (unknown fields, wrong types), the version is
-    /// not 1, or the config means something the widget cannot express — the
+    /// not 1, or the config means something the widget cannot express, the
     /// widget stays out of the way and the raw JSON is edited by hand;
     /// nothing is reinterpreted silently.
     Raw,
@@ -544,7 +569,7 @@ impl BuilderState {
             return Ingest::Raw;
         }
         // An empty allowlist means "output nothing" and an empty `match`
-        // pattern matches everywhere — real configs the widget cannot
+        // pattern matches everywhere, real configs the widget cannot
         // express, so they stay in raw mode instead of flipping meaning.
         if config
             .filter
@@ -570,7 +595,7 @@ impl BuilderState {
         {
             return Ingest::Raw;
         }
-        // Same raw-guard for drop: an empty `match` discards everything —
+        // Same raw-guard for drop: an empty `match` discards everything ,
         // a real rule the widget cannot express (its empty line means
         // "not typed yet"). ASN-targeted rules carry no pattern by
         // design; the `asns` field is the source of truth.
@@ -724,7 +749,7 @@ impl BuilderState {
 /// precomputed `(value, is_selected)` option rows so the askama template
 /// stays dumb. The list columns may also carry values the validator will
 /// reject (an unknown protocol/status typed or imported): they render as
-/// extra checked rows instead of silently disappearing — the administrator
+/// extra checked rows instead of silently disappearing, the administrator
 /// sees exactly what will be reported and can uncheck or replace it.
 #[derive(Debug, Clone)]
 pub(crate) struct BuilderView {
@@ -739,7 +764,7 @@ impl BuilderView {
     /// Render view for a state; rename rows always show at least one empty
     /// line so the widget offers a place to start typing.
     pub(crate) fn new(state: &BuilderState) -> Self {
-        // Schema options first, then any selected value outside the schema —
+        // Schema options first, then any selected value outside the schema ,
         // it must stay visible (and stay checked) until the admin acts.
         let mut protocols: Vec<(String, bool)> = Schema::protocols()
             .into_iter()
@@ -785,7 +810,7 @@ impl BuilderView {
 
     /// The geo section is being overridden: the user has picked "set" or
     /// "defaults". The widget uses this to gate the inner `geo.enabled`
-    /// flag and the template input — both are meaningless when the
+    /// flag and the template input, both are meaningless when the
     /// section is `skip` (no `geo` block is emitted and any typed values
     /// would be silently dropped).
     pub(crate) fn geo_section_active(&self) -> bool {
@@ -866,7 +891,7 @@ impl Schema {
         SortBy::ALL.iter().map(|s| s.as_str()).collect()
     }
 
-    /// Geo template placeholders — all six that
+    /// Geo template placeholders, all six that
     /// `fumox_core::geo::apply_template` renders, so the hint cannot drift
     /// from the engine.
     pub(crate) fn geo_placeholders() -> [&'static str; 6] {
@@ -881,17 +906,8 @@ impl Schema {
     }
 }
 
-fn strings(values: &[String]) -> serde_json::Value {
-    serde_json::Value::Array(
-        values
-            .iter()
-            .map(|value| serde_json::Value::from(value.as_str()))
-            .collect(),
-    )
-}
-
 /// Split the comma-separated ASN text field into trimmed entries. `None`
-/// when the field is empty (nothing configured — the key is not emitted);
+/// when the field is empty (nothing configured, the key is not emitted);
 /// a non-numeric entry survives verbatim, exactly like an unknown protocol
 /// in a checkbox: the preview/save validation reports it instead of the
 /// widget silently dropping what was typed.
@@ -924,7 +940,7 @@ pub(crate) struct PreviewFragment {
 
 impl_i18n!(PreviewFragment);
 
-/// Render the preview body for a state — the preview endpoint's response and
+/// Render the preview body for a state, the preview endpoint's response and
 /// the initial content of the widget's preview area share it.
 pub(crate) fn preview_body(lang: &Lang, built: &BuilderState) -> String {
     let fragment = match built.emit() {
@@ -959,7 +975,7 @@ pub(crate) fn preview_body(lang: &Lang, built: &BuilderState) -> String {
 }
 
 /// `#ped-rows` / `#ped-drop-rows` content: the rule lines of one section
-/// after add/remove. `section` is `"rename"` or `"drop"` — the template
+/// after add/remove. `section` is `"rename"` or `"drop"`, the template
 /// picks the row set, the field prefix and the section's own container id.
 #[derive(Template)]
 #[template(path = "pipeline/_rows.html")]
@@ -987,7 +1003,7 @@ impl RowsFragment {
 impl_i18n!(RowsFragment);
 
 /// The whole pipeline widget: the mode switch (builder ⇄
-/// raw), presets, the builder fields with their preview — or the raw JSON
+/// raw), presets, the builder fields with their preview, or the raw JSON
 /// textarea. Rendered into the source/profile forms at construction time and
 /// swapped by the `mode`/`preset` endpoints; `pipeline_mode` tells the save
 /// path which representation is authoritative.
@@ -996,7 +1012,7 @@ impl_i18n!(RowsFragment);
 pub(crate) struct WidgetFragment {
     pub lang: Lang,
     pub builder: BuilderView,
-    /// `"builder"` or `"raw"` — the `pipeline_mode` value of the form.
+    /// `"builder"` or `"raw"`, the `pipeline_mode` value of the form.
     pub mode: &'static str,
     /// Raw-mode textarea content.
     pub pipeline_value: String,
@@ -1004,7 +1020,7 @@ pub(crate) struct WidgetFragment {
     /// Localized pipeline validation error to show next to the fields.
     pub error: Option<String>,
     /// Raw mode was entered because the stored JSON is not representable
-    /// — the template shows the warning.
+    ///, the template shows the warning.
     pub raw_warning: bool,
     /// Profile form: tri-state section controls (inherit / defaults / set).
     pub profile: bool,
@@ -1195,11 +1211,11 @@ mod tests {
         let mut s = state();
         s.filter_set = true;
         s.protocols = vec!["ss".into()];
-        s.forbid_insecure = true; // default — not emitted
+        s.forbid_insecure = true; // default, not emitted
         s.geo_set = true;
-        s.geo_template = "{flag} {country} · {name}".into(); // default — not emitted
+        s.geo_template = "{flag} {country} · {name}".into(); // default, not emitted
         s.rename = vec![
-            RenameRow::default(), // empty — skipped
+            RenameRow::default(), // empty, skipped
             RenameRow {
                 match_pattern: "^free".into(),
                 replace: String::new(),
@@ -1221,7 +1237,7 @@ mod tests {
     fn emit_writes_the_target_and_ingest_splits_it_back() {
         let mut s = state();
         s.rename = vec![
-            // name stays implicit — the schema default, never emitted.
+            // name stays implicit, the schema default, never emitted.
             RenameRow {
                 match_pattern: "a".into(),
                 replace: "b".into(),
@@ -1255,7 +1271,7 @@ mod tests {
                 ]
             }))
         );
-        // …and the emitted JSON rebuilds the same split form — `name`, the
+        // …and the emitted JSON rebuilds the same split form, `name`, the
         // schema default, comes back as the select's implicit value ("").
         let Some(json) = s.emit() else {
             panic!("must emit")
@@ -1355,7 +1371,7 @@ mod tests {
         s.drop = vec![
             DropRow {
                 match_pattern: "free|trial".into(),
-                target: String::new(), // name — implicit
+                target: String::new(), // name, implicit
                 param_key: String::new(),
                 flags: "i".into(),
                 asns: String::new(),
@@ -1423,7 +1439,7 @@ mod tests {
     #[test]
     fn drop_asn_target_emit_skips_match_and_flags() {
         // Even if the user typed something into the match field of an
-        // ASN row by accident, the JSON emit must not include it — the
+        // ASN row by accident, the JSON emit must not include it, the
         // validator rejects `match` on ASN rules, so emitting it would
         // fail the save-time validation.
         let mut s = state();
@@ -1445,7 +1461,7 @@ mod tests {
 
     #[test]
     fn drop_explicit_defaults_and_tri_state_round_trip() {
-        // `drop: []` in a profile resets the source's rules — the same
+        // `drop: []` in a profile resets the source's rules, the same
         // profile semantics as rename.
         let mut s = state();
         s.drop_defaults = true;
@@ -1512,7 +1528,7 @@ mod tests {
 
     #[test]
     fn ingest_sends_drop_rules_with_empty_match_to_raw_mode() {
-        // An empty `match` discards everything — a real config the widget
+        // An empty `match` discards everything, a real config the widget
         // cannot express; raw mode keeps it editable as JSON.
         let json = json!({ "version": 1, "drop": [{ "match": "" }] });
         assert_eq!(BuilderState::ingest(Some(&json)), Ingest::Raw);
@@ -1664,7 +1680,7 @@ mod tests {
 
     #[test]
     fn empty_asns_array_stays_in_raw_mode() {
-        // `asns: []` means "keep nothing" — a real config the text field
+        // `asns: []` means "keep nothing", a real config the text field
         // cannot express (empty there is "not set"), so ingest routes it
         // to raw mode like an empty protocols allowlist.
         assert_eq!(
@@ -1684,7 +1700,7 @@ mod tests {
         // checkboxes).
         let mut s = state();
         s.filter_set = true;
-        s.asns = " 24940 , , oops ".into();
+        s.asns = " 24940 , oops ".into();
 
         let json = s.emit().expect("must emit");
         assert_eq!(
@@ -1715,7 +1731,7 @@ mod tests {
         assert!(rebuilt.limit_set);
         assert_eq!(rebuilt.limit_count, "100");
 
-        // Defaults: an explicit `null` cap — the profile resets the
+        // Defaults: an explicit `null` cap, the profile resets the
         // source's limit back to "no cap".
         let mut d = state();
         d.limit_defaults = true;
@@ -1773,13 +1789,13 @@ mod tests {
     #[test]
     fn from_form_without_fields_is_a_clean_slate() {
         // No `ped_*` fields at all: every checkbox unchecked, every list
-        // empty — the emit is NULL, exactly like an untouched widget.
+        // empty, the emit is NULL, exactly like an untouched widget.
         let s = BuilderState::from_form(&[("name".into(), "x".into())]);
         assert!(!s.filter_set && !s.geo_set && !s.health_set && !s.sort_set);
         assert!(!s.forbid_insecure && !s.geo_enabled && !s.sort_desc);
         assert!(s.rename.is_empty());
         assert_eq!(s.emit(), None);
-        // A rendered widget starts from different defaults — the built-in ones.
+        // A rendered widget starts from different defaults, the built-in ones.
         let fresh = BuilderState::new();
         assert!(fresh.forbid_insecure && fresh.geo_enabled);
         assert_eq!(fresh.exclude_statuses, ["quarantine", "removed"]);
@@ -1830,7 +1846,7 @@ mod tests {
 
     #[test]
     fn ingest_accepts_the_legacy_normalize_params_name() {
-        // Old exports carry "normalize_params": false — the v1 name of the
+        // Old exports carry "normalize_params": false, the v1 name of the
         // same switch (serde alias in FilterConfig). The widget rebuilds
         // from it, and the emit writes the current name back.
         let legacy = json!({
@@ -1922,11 +1938,11 @@ mod tests {
     #[test]
     fn ingest_rejects_configs_the_builder_cannot_represent() {
         // An empty allowlist means "output nothing"; dropping it would allow
-        // everything — raw mode instead of silent reinterpretation.
+        // everything, raw mode instead of silent reinterpretation.
         let empty_allowlist = json!({ "version": 1, "filter": { "protocols": [] } });
         assert_eq!(BuilderState::ingest(Some(&empty_allowlist)), Ingest::Raw);
 
-        // An empty `match` pattern matches everywhere — a real rule the
+        // An empty `match` pattern matches everywhere, a real rule the
         // widget cannot express (its empty row means "not typed yet").
         let empty_pattern = json!({ "version": 1, "rename": [{ "match": "", "replace": "x" }] });
         assert_eq!(BuilderState::ingest(Some(&empty_pattern)), Ingest::Raw);
@@ -1934,7 +1950,7 @@ mod tests {
 
     #[test]
     fn ingest_keeps_values_the_validator_will_flag() {
-        // Unknown names are structural strings — the builder holds them and
+        // Unknown names are structural strings, the builder holds them and
         // the preview/save validation reports them.
         let json = json!({
             "version": 1,
@@ -2094,7 +2110,9 @@ mod tests {
                 "tuic",
                 "mieru",
                 "socks5",
-                "naive"
+                "naive",
+                "snell",
+                "anytls"
             ]
         );
         assert_eq!(
@@ -2236,7 +2254,7 @@ mod tests {
             .render()
             .unwrap_or_default();
         // Every drop row's target select carries the htmx wiring: note the
-        // `&render=1` flag — a target change must NOT append a fresh row,
+        // `&render=1` flag, a target change must NOT append a fresh row,
         // which is what the explicit *Add rule* button does.
         assert!(
             html.contains("name=\"ped_drop_0_target\"")
@@ -2250,7 +2268,7 @@ mod tests {
             "second row's target select also exists: {html}"
         );
 
-        // Rename rows do the same — different endpoint, different
+        // Rename rows do the same, different endpoint, different
         // container id.
         let html = RowsFragment::for_section(lang, BuilderView::new(&s), "rename")
             .render()
@@ -2268,7 +2286,7 @@ mod tests {
     fn preview_wrapper_triggers_on_both_change_and_input() {
         // The preview must update on every form change. `change` covers
         // selects/radios/checkboxes; `input` covers text/ASN fields as
-        // the administrator types — `change` alone only fires on blur for
+        // the administrator types, `change` alone only fires on blur for
         // text inputs, so the preview would otherwise stay stale.
         let lang = test_lang();
         let state = BuilderState::new();
@@ -2308,7 +2326,7 @@ mod tests {
         let html = widget.html();
         assert!(html.contains(r#"value="builder""#), "{html}");
         assert!(html.contains("ped_filter_protocols"), "{html}");
-        assert!(html.contains("Сгенерированный pipeline JSON"), "{html}");
+        assert!(html.contains("Сгенерированный конвейер JSON"), "{html}");
         assert!(
             html.contains("hx-post=\"/admin/pipeline/preview\""),
             "{html}"
@@ -2320,7 +2338,10 @@ mod tests {
         let html = widget.html();
         assert!(html.contains(r#"value="raw""#), "{html}");
         assert!(html.contains("id=\"pipeline-field\""), "{html}");
-        assert!(html.contains("конструктор не представляет"), "{html}");
+        assert!(
+            html.contains("невозможно представить в конструкторе"),
+            "{html}"
+        );
         assert!(!html.contains("ped_filter_protocols"), "{html}");
     }
 
@@ -2388,7 +2409,7 @@ mod tests {
     }
 
     /// The source form's geo section can now emit `geo: {}` (explicit
-    /// defaults) — this was unreachable before the tri-state radio was
+    /// defaults), this was unreachable before the tri-state radio was
     /// added to the source form. The `defaults` branch of `emit()` writes
     /// the empty object, and `merge_configs` then treats it as an explicit
     /// "use defaults" override at the profile layer.
@@ -2413,7 +2434,7 @@ mod tests {
     /// When the section is `set` and the inner disable checkbox is
     /// unchecked, `geo.enabled` is `false` and any non-default template
     /// is emitted. This is the only path where the inner flag actually
-    /// persists — proves the labelled "Disable geo enrichment" checkbox
+    /// persists, proves the labelled "Disable geo enrichment" checkbox
     /// still controls what gets saved.
     #[test]
     fn geo_set_with_disable_persists_enabled_false() {
@@ -2462,7 +2483,7 @@ mod tests {
     }
 
     /// The source form's sort section can now emit `sort: {}` (explicit
-    /// defaults) — this was unreachable before the tri-state radio was
+    /// defaults), this was unreachable before the tri-state radio was
     /// added to the source form. The `defaults` branch of `emit()`
     /// writes the empty object.
     #[test]
@@ -2503,7 +2524,7 @@ mod tests {
     }
 
     /// The source form's limit section can now emit `limit: { count:
-    /// null }` (explicit defaults reset) — this was unreachable from the
+    /// null }` (explicit defaults reset), this was unreachable from the
     /// source form before the tri-state radio was added.
     #[test]
     fn limit_defaults_round_trips_through_emit() {
@@ -2671,7 +2692,7 @@ mod tests {
 
     /// Every section's `defaults` branch on the profile form must produce
     /// an explicit empty block in JSON. This is the "profile resets the
-    /// source's section to the built-in defaults" affordance — without the
+    /// source's section to the built-in defaults" affordance, without the
     /// explicit `{}`/`[]`/`null`, the merge would inherit instead of
     /// reset.
     #[test]

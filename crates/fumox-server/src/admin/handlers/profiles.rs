@@ -2,13 +2,15 @@
 //!, card with dedup stats and an in-process output
 //! preview, toggle / delete actions.
 
-use super::{action_response, caps, is_htmx, mask_secret, not_found, server_error};
+use super::{
+    action_response, caps, is_htmx, mask_secret, not_found, pipeline_from_form, server_error,
+    validate_slug,
+};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
-use crate::admin::pipeline_editor::{BuilderState, widget_from_posted, widget_from_stored};
+use crate::admin::pipeline_editor::{widget_from_posted, widget_from_stored};
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
-use crate::pipeline::CompiledPipeline;
 use askama::Template;
 use axum::extract::{ConnectInfo, Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -18,36 +20,10 @@ use fumox_core::repo::{profiles, sources};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-/// Slug rules shared with sources: starts alphanumeric,
-/// then `[A-Za-z0-9_-]`, total length 2–64.
-const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
-
 /// Preview length on the profile card.
 const PREVIEW_LINES: usize = 50;
 
-// ---------------------------------------------------------------------------
 // List
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, sqlx::FromRow)]
-struct ProfileListRow {
-    id: String,
-    name: String,
-    slug: Option<String>,
-    output_format: String,
-    enabled: bool,
-    protected: bool,
-    sources_count: i64,
-    /// Ready proxies reachable through the profile's sources: `status =
-    /// 'ready'` — i.e. the set the `/sub/{slug}` endpoint would actually
-    /// emit right now (the pipeline has vetted them and the probe is done
-    /// with the second-chance ladder). Pre-ready statuses (`alive`,
-    /// `quarantine`, `unknown`) and terminal `removed` are excluded, since
-    /// none of those would show up in the live subscription output.
-    /// A proxy reachable through more than one source in the same profile
-    /// is counted once (`DISTINCT px.id`).
-    proxies_count: i64,
-}
 
 #[derive(Template)]
 #[template(path = "profiles/list.html")]
@@ -57,7 +33,7 @@ struct ProfilesListTemplate {
     theme: Theme,
     active: &'static str,
     csrf: String,
-    rows: Vec<ProfileListRow>,
+    rows: Vec<profiles::ProfileListRow>,
 }
 
 impl_i18n!(ProfilesListTemplate);
@@ -65,22 +41,7 @@ impl_i18n!(ProfilesListTemplate);
 pub async fn profiles_list(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
-    let rows: Vec<ProfileListRow> = match sqlx::query_as(
-        "SELECT p.id, p.name, p.slug, p.output_format, p.enabled,
-                p.access_token IS NOT NULL AS protected,
-                (SELECT COUNT(*) FROM profile_sources ps WHERE ps.profile_id = p.id) AS sources_count,
-                (SELECT COUNT(DISTINCT px.id)
-                 FROM profile_sources ps
-                 JOIN proxy_source_links l ON l.source_id = ps.source_id
-                 JOIN proxies px ON px.id = l.proxy_id
-                 WHERE ps.profile_id = p.id
-                   AND px.status = 'ready') AS proxies_count
-         FROM profiles p
-         ORDER BY p.created_at",
-    )
-    .fetch_all(&state.pool)
-    .await
-    {
+    let rows: Vec<profiles::ProfileListRow> = match profiles::list_with_counts(&state.pool).await {
         Ok(rows) => rows,
         Err(err) => return server_error(lang, &err),
     };
@@ -98,9 +59,7 @@ pub async fn profiles_list(State(state): State<AdminState>, headers: HeaderMap) 
     )
 }
 
-// ---------------------------------------------------------------------------
 // Form (create / edit)
-// ---------------------------------------------------------------------------
 
 /// Display/edit values of the profile form (all as strings, as typed). The
 /// pipeline is carried by the widget HTML, not by these values.
@@ -153,16 +112,7 @@ struct ProfileFormTemplate {
     widget_html: String,
 }
 
-impl ProfileFormTemplate {
-    fn error_for(&self, field: &str) -> Option<&str> {
-        self.errors
-            .iter()
-            .find(|(f, _)| f == field)
-            .map(|(_, m)| m.as_str())
-    }
-}
-
-impl_i18n!(ProfileFormTemplate);
+impl_i18n!(ProfileFormTemplate, errors);
 
 fn format_options(selected: &str, lang: &Lang) -> Vec<FormatOption> {
     vec![
@@ -245,7 +195,7 @@ pub async fn profile_form(State(state): State<AdminState>, headers: HeaderMap) -
             formats,
             source_picks: picks,
             token_masked_note: false,
-            // New profile: nothing stored yet — an empty builder widget.
+            // New profile: nothing stored yet, an empty builder widget.
             widget_html: widget_from_stored(
                 lang,
                 &state.csrf_for(&headers),
@@ -385,30 +335,35 @@ async fn build_profile_from_form(
     }
 
     let slug_raw = get("slug");
-    let slug = if slug_raw.is_empty() {
-        None
-    } else {
-        if !regex::Regex::new(SLUG_RE).is_ok_and(|re| re.is_match(&slug_raw)) {
-            errors.push(("slug".into(), lang.t("val.slug_format").into()));
-        } else if let Ok(Some(other)) = profiles::get_by_slug(&state.pool, &slug_raw).await
-            && other.id != existing_id.unwrap_or_default()
-        {
-            errors.push(("slug".into(), lang.t("val.slug_taken").into()));
-        }
-        Some(slug_raw)
-    };
+    let slug = validate_slug(
+        &slug_raw,
+        existing_id,
+        lang,
+        &mut errors,
+        profiles::get_by_slug(&state.pool, &slug_raw),
+    )
+    .await;
 
-    // Access token: an unchanged masked placeholder keeps the stored secret;
-    // an empty field clears the token (public endpoint).
+    // The mask is resolved before validation: `…`/`•` are outside the token
+    // charset, so an unchanged placeholder must never be checked as typed.
     let token_raw = get("access_token");
-    let mut access_token = if token_raw.is_empty() {
-        None
-    } else {
-        Some(token_raw.clone())
+    let stored = match existing_id {
+        Some(id) => profiles::get(&state.pool, id).await.ok().flatten(),
+        None => None,
+    };
+    let stored_token = stored
+        .as_ref()
+        .and_then(|p| p.access_token.as_deref())
+        .filter(|secret| token_raw == mask_secret(secret));
+    let access_token = match stored_token {
+        Some(secret) => Some(secret.to_string()),
+        None if token_raw.is_empty() => None,
+        None => Some(token_raw.clone()),
     };
     // Token format cap: the token guards a public
     // endpoint, so it is URL-safe and bounded like every other field.
-    if let Some(token) = access_token.as_ref()
+    if stored_token.is_none()
+        && let Some(token) = access_token.as_ref()
         && token.len() > caps::ACCESS_TOKEN
     {
         errors.push((
@@ -416,18 +371,13 @@ async fn build_profile_from_form(
             lang.t("val.field_too_long")
                 .replace("{}", &caps::ACCESS_TOKEN.to_string()),
         ));
-    } else if let Some(token) = access_token.as_ref()
+    } else if stored_token.is_none()
+        && let Some(token) = access_token.as_ref()
         && !token
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
     {
         errors.push(("access_token".into(), lang.t("val.token_format").into()));
-    }
-    if let Some(id) = existing_id
-        && token_raw.contains('•')
-        && let Ok(Some(stored)) = profiles::get(&state.pool, id).await
-    {
-        access_token = stored.access_token;
     }
 
     let format_raw = get("output_format");
@@ -439,75 +389,10 @@ async fn build_profile_from_form(
         }
     };
 
-    // Pipeline: in builder mode the JSON is generated
-    // from the widget fields server-side (a stale `pipeline` textarea, if
-    // any, is ignored); in raw mode the textarea is the input, as before.
-    // The tri-state radios let a profile explicitly reset a source's
-    // section to the built-in defaults by emitting an empty section.
-    let pipeline = if get("pipeline_mode") == "builder" {
-        let generated = BuilderState::from_form(form).emit();
-        match generated {
-            None => None,
-            Some(value) => match CompiledPipeline::from_json(Some(&value)) {
-                Ok(_) => {
-                    // Same cap as raw mode: the
-                    // generated JSON is stored verbatim and re-rendered
-                    // into every edit form, so a form with thousands of
-                    // widget rows must not exceed the budget either.
-                    let bytes = serde_json::to_string(&value).map_or(usize::MAX, |text| text.len());
-                    if bytes > caps::PIPELINE_BYTES {
-                        errors.push((
-                            "pipeline".into(),
-                            lang.t("val.field_too_long")
-                                .replace("{}", &caps::PIPELINE_BYTES.to_string()),
-                        ));
-                        None
-                    } else {
-                        Some(value)
-                    }
-                }
-                Err(issues) => {
-                    for issue in issues {
-                        errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
-                    }
-                    None
-                }
-            },
-        }
-    } else {
-        let pipeline_raw = get("pipeline");
-        if pipeline_raw.trim().is_empty() {
-            None
-        } else if pipeline_raw.len() > caps::PIPELINE_BYTES {
-            // Pipeline cap: the JSON is stored
-            // verbatim and re-rendered into every edit form.
-            errors.push((
-                "pipeline".into(),
-                lang.t("val.field_too_long")
-                    .replace("{}", &caps::PIPELINE_BYTES.to_string()),
-            ));
-            None
-        } else {
-            match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {
-                Ok(value) => match CompiledPipeline::from_json(Some(&value)) {
-                    Ok(_) => Some(value),
-                    Err(issues) => {
-                        for issue in issues {
-                            errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
-                        }
-                        None
-                    }
-                },
-                Err(err) => {
-                    errors.push((
-                        "pipeline".into(),
-                        lang.t("val.invalid_json").replace("{}", &err.to_string()),
-                    ));
-                    None
-                }
-            }
-        }
-    };
+    // Pipeline: the shared form validation. The tri-state radios let a
+    // profile explicitly reset a source's section to the built-in defaults
+    // by emitting an empty section.
+    let pipeline = pipeline_from_form(form, lang, &mut errors);
 
     // Country allowlist: comma-separated ISO 3166-1 alpha-2 codes; empty
     // means no filtering. Validated per code, normalized to uppercase.
@@ -557,10 +442,6 @@ async fn build_profile_from_form(
     }
 
     let now = now_ts();
-    let existing = match existing_id {
-        Some(id) => profiles::get(&state.pool, id).await.ok().flatten(),
-        None => None,
-    };
 
     Ok(Profile {
         id: existing_id.map(str::to_string).unwrap_or_else(new_id),
@@ -571,7 +452,9 @@ async fn build_profile_from_form(
         pipeline,
         countries,
         enabled: form.iter().any(|(k, _)| k == "enabled"),
-        created_at: existing.map(|p| p.created_at).unwrap_or(now),
+        // `stored` is the row read above for the mask, so `created_at`
+        // carries over without a second query.
+        created_at: stored.as_ref().map(|p| p.created_at).unwrap_or(now),
         updated_at: now,
     })
 }
@@ -691,17 +574,7 @@ pub async fn profile_update(
     Redirect::to(&format!("/admin/profiles/{}", profile.id)).into_response()
 }
 
-// ---------------------------------------------------------------------------
 // Card
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, sqlx::FromRow)]
-struct CompositionRow {
-    source_id: String,
-    position: i64,
-    name: Option<String>,
-    enabled: Option<bool>,
-}
 
 #[derive(Template)]
 #[template(path = "profiles/detail.html")]
@@ -717,18 +590,16 @@ struct ProfileDetailTemplate {
     token_display: String,
     countries_display: String,
     pipeline_display: String,
-    composition: Vec<CompositionRow>,
+    composition: Vec<profiles::CompositionRow>,
     stats_total: i64,
     stats_unique: i64,
     stats_dupes: i64,
     preview: Vec<String>,
     preview_note: Option<String>,
-}
-
-impl ProfileDetailTemplate {
-    fn ts(&self, ts: &i64) -> String {
-        super::fmt_ts_element(*ts)
-    }
+    /// The card includes `profiles/_toggle_form.html`, whose standalone
+    /// variant marks the form as an out-of-band swap in the toggle
+    /// response; the page itself always renders it plain.
+    swap_oob: bool,
 }
 
 impl_i18n!(ProfileDetailTemplate);
@@ -747,49 +618,32 @@ pub async fn profile_detail(
         Err(err) => return server_error(lang, &err),
     };
 
-    let composition: Vec<CompositionRow> = match sqlx::query_as(
-        "SELECT ps.source_id, ps.position, s.name, s.enabled
-         FROM profile_sources ps LEFT JOIN sources s ON s.id = ps.source_id
-         WHERE ps.profile_id = ?
-         ORDER BY ps.position, ps.source_id",
-    )
-    .bind(&id)
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
-    };
+    let composition: Vec<profiles::CompositionRow> =
+        match profiles::composition(&state.pool, &id).await {
+            Ok(rows) => rows,
+            Err(err) => return server_error(lang, &err),
+        };
 
     // Dedup statistics across the composition:
     // total link rows vs distinct fingerprints.
-    let (stats_total, stats_unique): (i64, i64) = match sqlx::query_as(
-        "SELECT COUNT(*), COUNT(DISTINCT p.fingerprint)
-         FROM profile_sources ps
-         JOIN proxy_source_links l ON l.source_id = ps.source_id
-         JOIN proxies p ON p.id = l.proxy_id
-         WHERE ps.profile_id = ?",
-    )
-    .bind(&id)
-    .fetch_one(&state.pool)
-    .await
-    {
-        Ok(row) => row,
+    let stats = match profiles::dedup_stats(&state.pool, &id).await {
+        Ok(stats) => stats,
         Err(err) => return server_error(lang, &err),
     };
+    let (stats_total, stats_unique) = (stats.total, stats.unique);
 
     // Output preview: render in-process exactly what /sub would serve.
-    let app_state = crate::serve::AppState {
-        pool: state.pool.clone(),
-        caches: state.caches.clone(),
-        geo: state.geo.clone(),
-        refresh_tx: state.refresh_tx.clone(),
+    let app_state = crate::serve::AppState::new(
+        state.pool.clone(),
+        state.caches.clone(),
+        state.geo.clone(),
         // The preview renders in-process and never crosses the public
         // rate-limit middleware; fresh counters here are never consulted.
-        limits: crate::serve::PublicRateLimits::unlimited(),
-        trusted_cidrs: Vec::new(),
-        allowed_hosts: Vec::new(),
-    };
+        crate::serve::PublicRateLimits::unlimited(),
+        Vec::new(),
+        Vec::new(),
+        state.server().export_max_rows,
+    );
     let (preview, preview_note) =
         match crate::serve::preview_sub(&app_state, &profile, PREVIEW_LINES).await {
             Ok(lines) if lines.is_empty() => {
@@ -806,13 +660,23 @@ pub async fn profile_detail(
         "/sub/{}",
         profile.slug.clone().unwrap_or_else(|| profile.id.clone())
     );
+    // A token-protected profile answers 403 without its token, and the
+    // token row below is masked, so the copyable endpoint link has to
+    // carry the secret in the query string or it could never be used.
+    // The token charset is unreserved ASCII only (`is_ascii_alphanumeric`
+    // plus `-_.~`), so it needs no escaping.
+    let serve_query = profile
+        .access_token
+        .as_deref()
+        .map(|token| format!("?token={token}"))
+        .unwrap_or_default();
     // Absolute serve link: the host the admin panel was opened on with the
     // public port from [server].bind.
     let base = match state.serve_base(peer, &headers) {
         Ok(b) => b,
         Err(err) => return super::server_error(lang, &fumox_core::Error::Config(err.to_string())),
     };
-    let serve_url = format!("{base}{serve_path}");
+    let serve_url = format!("{base}{serve_path}{serve_query}");
 
     let token_display = profile
         .access_token
@@ -848,14 +712,62 @@ pub async fn profile_detail(
             stats_unique,
             preview,
             preview_note,
+            swap_oob: false,
         },
         StatusCode::OK,
     )
 }
 
-// ---------------------------------------------------------------------------
 // Actions
-// ---------------------------------------------------------------------------
+
+/// The enabled badge of the profile card, as a standalone fragment: the
+/// detail page includes the same file, and the toggle action re-renders it
+/// after every swap, so the initial markup and the swap are one definition.
+#[derive(Template)]
+#[template(path = "profiles/_enabled_badge.html")]
+struct EnabledBadgeFragment {
+    lang: Lang,
+    profile: Profile,
+}
+
+impl_i18n!(EnabledBadgeFragment);
+
+/// The toggle form of the profile card, same include-as-initial-render
+/// pattern as [`EnabledBadgeFragment`]. `swap_oob` adds the
+/// `hx-swap-oob` attribute that makes the form in a toggle response
+/// replace itself out-of-band; the initial page renders it plain.
+#[derive(Template)]
+#[template(path = "profiles/_toggle_form.html")]
+struct ToggleFormFragment {
+    lang: Lang,
+    profile: Profile,
+    csrf: String,
+    swap_oob: bool,
+}
+
+impl_i18n!(ToggleFormFragment);
+
+/// The toggle response body: the badge swapped into `#enabled-badge`
+/// normally plus the form marked out-of-band. Both halves come from the
+/// fragment templates the detail page includes, so the ids, aria
+/// attributes and the hx-* contract cannot drift from the initial render.
+fn toggle_swap_fragment(lang: &Lang, profile: &Profile, csrf: &str) -> String {
+    let badge = EnabledBadgeFragment {
+        lang: lang.clone(),
+        profile: profile.clone(),
+    }
+    .render()
+    .expect("badge fragment renders");
+    let form = ToggleFormFragment {
+        lang: lang.clone(),
+        profile: profile.clone(),
+        csrf: csrf.to_string(),
+        swap_oob: true,
+    }
+    .render()
+    .expect("toggle form fragment renders");
+    format!("{badge}\n{form}")
+}
 
 pub async fn profile_toggle(
     State(state): State<AdminState>,
@@ -884,29 +796,12 @@ pub async fn profile_toggle(
         is_htmx(&headers),
         &format!("/admin/profiles/{id}"),
         // The wrapper id must survive the swap (the form's hx-target points
-        // at it), and the toggle button must flip with the state — it lives
+        // at it), and the toggle button must flip with the state, it lives
         // outside the badge, so it travels along as an out-of-band swap.
-        format!(
-            r##"<span id="enabled-badge"><span class="badge {}">{}</span></span>
-               <form id="toggle-form" method="post" action="/admin/profiles/{id}/toggle"
-                     hx-post="/admin/profiles/{id}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML"
-                     hx-swap-oob="outerHTML:#toggle-form">
-                 <input type="hidden" name="_csrf" value="{}">
-                 <button class="btn" type="submit">{}</button>
-               </form>"##,
-            if profile.enabled { "on" } else { "off" },
-            if profile.enabled {
-                lang.t("common.on")
-            } else {
-                lang.t("common.off")
-            },
-            state.csrf_for(&headers),
-            if profile.enabled {
-                lang.t("common.disable")
-            } else {
-                lang.t("common.enable")
-            }
-        ),
+        // Both elements are rendered from the same fragment templates the
+        // detail page includes, so the swap cannot drop the aria attributes
+        // or drift from the initial markup.
+        toggle_swap_fragment(&lang, &profile, &state.csrf_for(&headers)),
         message,
     )
 }
@@ -930,4 +825,325 @@ pub async fn profile_delete(
         String::new(),
         lang.t("prof.deleted_toast"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Admin state on a throwaway migrated database: the form builder
+    /// only touches the pool (slug/target lookups, stored token).
+    async fn test_state() -> (fumox_core::tempdir_lite::TempDir, AdminState) {
+        crate::admin::test_admin_state(Default::default(), Default::default()).await
+    }
+
+    fn stored_profile(token: Option<&str>) -> Profile {
+        let now = now_ts();
+        Profile {
+            id: new_id(),
+            slug: Some("p1".into()),
+            access_token: token.map(str::to_string),
+            name: "p1".into(),
+            output_format: OutputFormat::UriList,
+            pipeline: None,
+            countries: Vec::new(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The edit form re-renders the stored secret as `mask_secret`
+    /// (`abc…••••`) and posts it back verbatim on any save. That mask is
+    /// not a token, so the charset check used to reject it and the whole
+    /// save came back 422: a profile with an access token could never be
+    /// renamed, re-slugged or re-pointed at other sources.
+    #[tokio::test]
+    async fn unchanged_masked_token_keeps_the_stored_secret() {
+        let (_dir, state) = test_state().await;
+        let lang = state.locales.default_lang();
+        let secret = "supersecretvalue";
+        let stored = stored_profile(Some(secret));
+        profiles::create(&state.pool, &stored).await.unwrap();
+
+        // Exactly what GET /admin/profiles/{id}/edit hands the browser.
+        let masked = mask_secret(secret);
+        assert!(masked.contains('•'), "the form value is the mask {masked}");
+        let form: Vec<(String, String)> = vec![
+            ("name".into(), "renamed".into()),
+            ("slug".into(), "p1".into()),
+            ("access_token".into(), masked),
+            ("output_format".into(), "uri_list".into()),
+            ("enabled".into(), "on".into()),
+        ];
+
+        let built = build_profile_from_form(&state, &lang, &form, Some(&stored.id))
+            .await
+            .expect("posting the form back unchanged must save");
+        assert_eq!(
+            built.access_token.as_deref(),
+            Some(secret),
+            "the masked placeholder must keep the stored secret"
+        );
+        // The other fields of the same save did change.
+        assert_eq!(built.name, "renamed");
+
+        // An empty field still clears the token (public endpoint).
+        let form: Vec<(String, String)> = vec![
+            ("name".into(), "renamed".into()),
+            ("slug".into(), "p1".into()),
+            ("access_token".into(), String::new()),
+            ("output_format".into(), "uri_list".into()),
+        ];
+        let built = build_profile_from_form(&state, &lang, &form, Some(&stored.id))
+            .await
+            .expect("clearing the token must save");
+        assert_eq!(built.access_token, None);
+    }
+
+    /// The mask bypass is narrow: a token the operator actually typed is
+    /// still held to the format and the cap.
+    #[tokio::test]
+    async fn a_typed_token_is_still_validated() {
+        let (_dir, state) = test_state().await;
+        let lang = state.locales.default_lang();
+        let stored = stored_profile(None);
+        profiles::create(&state.pool, &stored).await.unwrap();
+
+        let with_token = |token: &str| -> Vec<(String, String)> {
+            vec![
+                ("name".into(), "p1".into()),
+                ("slug".into(), "free".into()),
+                ("access_token".into(), token.to_string()),
+                ("output_format".into(), "uri_list".into()),
+            ]
+        };
+
+        let errors = build_profile_from_form(&state, &lang, &with_token("bad token!"), None)
+            .await
+            .expect_err("a token outside the charset must be refused");
+        assert!(
+            errors.iter().any(|(field, _)| field == "access_token"),
+            "the format check must still fire: {errors:?}"
+        );
+
+        let over = "a".repeat(caps::ACCESS_TOKEN + 1);
+        let errors = build_profile_from_form(&state, &lang, &with_token(&over), None)
+            .await
+            .expect_err("an over-long token must be refused");
+        assert!(
+            errors.iter().any(|(field, _)| field == "access_token"),
+            "the cap must still fire: {errors:?}"
+        );
+
+        let built = build_profile_from_form(&state, &lang, &with_token("good-token_1"), None)
+            .await
+            .expect("a well-formed token must save");
+        assert_eq!(built.access_token.as_deref(), Some("good-token_1"));
+    }
+
+    /// Only the mask itself restores the stored secret; anything else typed is validated as typed.
+    #[tokio::test]
+    async fn a_typed_bullet_is_not_mistaken_for_the_mask() {
+        let (_dir, state) = test_state().await;
+        let lang = state.locales.default_lang();
+        let stored = stored_profile(Some("supersecretvalue"));
+        profiles::create(&state.pool, &stored).await.unwrap();
+
+        let with_token = |token: &str| -> Vec<(String, String)> {
+            vec![
+                ("name".into(), "p1".into()),
+                ("slug".into(), "p1".into()),
+                ("access_token".into(), token.to_string()),
+                ("output_format".into(), "uri_list".into()),
+            ]
+        };
+
+        // The mask itself still restores the stored secret.
+        let mask = mask_secret("supersecretvalue");
+        let built = build_profile_from_form(&state, &lang, &with_token(&mask), Some(&stored.id))
+            .await
+            .expect("the unchanged mask must save");
+        assert_eq!(built.access_token.as_deref(), Some("supersecretvalue"));
+
+        // A typed value that merely contains a bullet is not the mask, so
+        // it is validated like any other typed value: '•' is outside the
+        // token charset and the save is refused rather than silently
+        // keeping the old secret.
+        let errors =
+            build_profile_from_form(&state, &lang, &with_token("tok•en"), Some(&stored.id))
+                .await
+                .expect_err("a typed bullet must not resolve to the stored secret");
+        assert!(
+            errors.iter().any(|(field, _)| field == "access_token"),
+            "the format check must fire on a typed bullet: {errors:?}"
+        );
+
+        // …and a different, well-formed token rotates the secret.
+        let built = build_profile_from_form(
+            &state,
+            &lang,
+            &with_token("rotated-token"),
+            Some(&stored.id),
+        )
+        .await
+        .expect("a typed token must replace the stored one");
+        assert_eq!(built.access_token.as_deref(), Some("rotated-token"));
+    }
+
+    /// The shared slug validation: a bad format and a slug held by another
+    /// row are refused, the row's own slug survives an edit, and an empty
+    /// field simply means "no slug".
+    #[tokio::test]
+    async fn slug_validation_rejects_format_and_duplicate() {
+        let (_dir, state) = test_state().await;
+        let lang = state.locales.default_lang();
+        let mut stored = stored_profile(None);
+        stored.slug = Some("p1".into());
+        profiles::create(&state.pool, &stored).await.unwrap();
+
+        let with_slug = |slug: &str| -> Vec<(String, String)> {
+            vec![
+                ("name".into(), "p1".into()),
+                ("slug".into(), slug.to_string()),
+                ("output_format".into(), "uri_list".into()),
+            ]
+        };
+
+        // Bad format: outside the shared slug charset/length rules.
+        let errors = build_profile_from_form(&state, &lang, &with_slug("no spaces"), None)
+            .await
+            .expect_err("an invalid slug format must be refused");
+        assert!(
+            errors.iter().any(|(field, _)| field == "slug"),
+            "the format check must fire on the slug field: {errors:?}"
+        );
+
+        // Taken: a new profile may not claim the stored row's slug.
+        let errors = build_profile_from_form(&state, &lang, &with_slug("p1"), None)
+            .await
+            .expect_err("a slug held by another profile must be refused");
+        assert!(
+            errors.iter().any(|(field, _)| field == "slug"),
+            "the uniqueness check must fire on the slug field: {errors:?}"
+        );
+
+        // Editing the row itself: its own slug stays valid…
+        let built = build_profile_from_form(&state, &lang, &with_slug("p1"), Some(&stored.id))
+            .await
+            .expect("the row's own slug must stay valid on edit");
+        assert_eq!(built.slug.as_deref(), Some("p1"));
+
+        // …and an empty field stores no slug at all.
+        let built = build_profile_from_form(&state, &lang, &with_slug(""), None)
+            .await
+            .expect("an empty slug must save");
+        assert_eq!(built.slug, None);
+    }
+
+    /// A profile row for the swap-fragment tests (id and enabled flag are
+    /// all the templates read).
+    fn sample_profile(enabled: bool) -> Profile {
+        let now = now_ts();
+        Profile {
+            id: new_id(),
+            slug: Some("p1".into()),
+            access_token: None,
+            name: "p1".into(),
+            output_format: OutputFormat::UriList,
+            pipeline: None,
+            countries: Vec::new(),
+            enabled,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_lang() -> Lang {
+        crate::admin::i18n::Locales::load(std::path::Path::new("/nonexistent")).default_lang()
+    }
+
+    /// The toggle swap is rendered from the fragment templates the detail
+    /// page includes, so the ids, aria attributes and the hx-* contract
+    /// cannot drift apart.
+    #[test]
+    fn toggle_swap_fragment_carries_the_page_contract() {
+        let lang = test_lang();
+        let profile = sample_profile(true);
+        let swap = toggle_swap_fragment(&lang, &profile, "csrf-token");
+
+        assert!(
+            swap.contains(r#"<span id="enabled-badge" aria-live="polite" aria-atomic="true">"#),
+            "the badge half lost the live-region contract: {swap}"
+        );
+        assert!(swap.contains(r#"<span class="badge on">"#), "{swap}");
+        assert!(swap.contains(r#"id="toggle-form""#), "{swap}");
+        assert!(
+            swap.contains(&format!(
+                r#"hx-post="/admin/profiles/{}/toggle""#,
+                profile.id
+            )),
+            "{swap}"
+        );
+        assert!(
+            swap.contains(r##"hx-target="#enabled-badge""##),
+            "the form must keep targeting the badge: {swap}"
+        );
+        assert!(
+            swap.contains(r#"hx-swap-oob="outerHTML:#toggle-form""#),
+            "the form must travel as an out-of-band swap: {swap}"
+        );
+        assert!(
+            swap.contains(r#"aria-pressed="true""#),
+            "the pressed state must flip with the badge: {swap}"
+        );
+        assert!(swap.contains(r#"value="csrf-token""#), "{swap}");
+        assert!(swap.contains(lang.t("common.disable")), "{swap}");
+        assert!(swap.contains(lang.t("common.on")), "{swap}");
+    }
+
+    /// The disabled flip: badge class, pressed state and button label all
+    /// follow the stored state.
+    #[test]
+    fn toggle_swap_fragment_flips_with_the_disabled_state() {
+        let lang = test_lang();
+        let swap = toggle_swap_fragment(&lang, &sample_profile(false), "csrf-token");
+
+        assert!(swap.contains(r#"<span class="badge off">"#), "{swap}");
+        assert!(!swap.contains(r#"<span class="badge on">"#), "{swap}");
+        assert!(swap.contains(r#"aria-pressed="false""#), "{swap}");
+        assert!(swap.contains(lang.t("common.enable")), "{swap}");
+    }
+
+    /// Byte-compatibility: the page renders the form fragment with
+    /// `swap_oob = false`, the swap with `swap_oob = true`, and the two
+    /// outputs are identical apart from exactly the one attribute.
+    #[test]
+    fn the_oob_marker_is_the_only_difference_from_the_page_render() {
+        let lang = test_lang();
+        let profile = sample_profile(true);
+        let page_form = ToggleFormFragment {
+            lang: lang.clone(),
+            profile: profile.clone(),
+            csrf: "csrf-token".into(),
+            swap_oob: false,
+        }
+        .render()
+        .unwrap();
+        let swap_form = ToggleFormFragment {
+            lang: lang.clone(),
+            profile,
+            csrf: "csrf-token".into(),
+            swap_oob: true,
+        }
+        .render()
+        .unwrap();
+
+        assert!(!page_form.contains("hx-swap-oob"), "{page_form}");
+        assert_eq!(
+            swap_form.replace(r#" hx-swap-oob="outerHTML:#toggle-form""#, ""),
+            page_form,
+            "the swap render must be the page render plus the oob marker"
+        );
+    }
 }

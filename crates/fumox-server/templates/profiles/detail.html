@@ -5,18 +5,15 @@
 {% block content %}
 <div class="page-head">
   <h1>{{ profile.name }}</h1>
-  <span id="enabled-badge">
-    {% if profile.enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
-  </span>
+  {#- The badge and the toggle form are the same fragment templates the
+      toggle action re-renders for its HTMX swap, so the initial markup and
+      every swap share one definition. -#}
+  {% include "profiles/_enabled_badge.html" %}
   <span class="spacer"></span>
   <div class="row-actions">
     <a class="btn" href="/admin/profiles/{{ profile.id }}/edit">{{ self.t("common.edit") }}</a>
-    <form id="toggle-form" method="post" action="/admin/profiles/{{ profile.id }}/toggle"
-          hx-post="/admin/profiles/{{ profile.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML">
-      <input type="hidden" name="_csrf" value="{{ csrf }}">
-      <button class="btn" type="submit">{% if profile.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
-    </form>
-    <button class="btn danger" type="button" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
+    {% include "profiles/_toggle_form.html" %}
+    <button class="btn danger" type="button" aria-haspopup="dialog" aria-controls="delete-dialog" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
   </div>
 </div>
 
@@ -98,7 +95,8 @@
   {% endif %}
 </div>
 
-<dialog id="delete-dialog">
+<dialog id="delete-dialog" aria-labelledby="delete-dialog-title">
+  <h2 id="delete-dialog-title" class="visually-hidden">{{ self.t("prof.delete_confirm") }}</h2>
   <form method="post" action="/admin/profiles/{{ profile.id }}/delete">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <p>{{ self.t("prof.delete_confirm") }} <b>{{ profile.name }}</b>?</p>

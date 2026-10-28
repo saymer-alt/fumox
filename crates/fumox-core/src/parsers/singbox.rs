@@ -2,14 +2,16 @@
 //!
 //! Two JSON dialects share the `outbounds` key and are both accepted:
 //!
-//! * **sing-box native** — outbounds carry `type`/`server`/`server_port`;
+//! * **sing-box native**, outbounds carry `type`/`server`/`server_port`;
 //!   the mapping is the exact inverse of the [`crate::formats::singbox`]
 //!   output encoder, so `parse ∘ encode_singbox` round-trips;
-//! * **Xray/v2ray-core ("vnext")** — outbounds carry
+//! * **Xray/v2ray-core ("vnext")**, outbounds carry
 //!   `protocol`/`settings.vnext`/`streamSettings`. The payload may also be
 //!   a bare array of such configs (the v2rayN share format), and the
 //!   per-config keys sing-box ignores (`dns`, `routing`, `remarks`, …) are
-//!   simply not read.
+//!   simply not read. Both the endpoint array (`vnext`, `servers`) and each
+//!   endpoint's `users` array are iterated in full: every user is a
+//!   separate credential and therefore a separate entry.
 //!
 //! Supported proxy types: vless, vmess, trojan, shadowsocks, hysteria2,
 //! socks. Types that are not proxies at all (`selector`, `urltest`,
@@ -143,9 +145,7 @@ fn vec1(entry: ProxyEntry) -> Vec<ProxyEntry> {
     vec![entry]
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 // sing-box native dialect
-// ─────────────────────────────────────────────────────────────────────────
 
 fn native_vless(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, String> {
     let (host, port) = native_endpoint(map)?;
@@ -182,7 +182,7 @@ fn native_vmess(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, Stri
     let credential = required_str(map, "uuid")?;
     let mut params = Vec::new();
     // vmess JSON spells the cipher `security` internally (`scy`) and TLS as
-    // `tls: "tls"` — same convention as the vmess URI parser.
+    // `tls: "tls"`, same convention as the vmess URI parser.
     if let Some(scy) = str_field(map, "security") {
         push_param(&mut params, true, "scy", scy);
     }
@@ -462,86 +462,169 @@ fn native_transport_params(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 // Xray/v2ray-core ("vnext") dialect
-// ─────────────────────────────────────────────────────────────────────────
 
 fn xray_vless(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
     let mut entries = Vec::new();
+    let mut endpoints = 0usize;
     for vnext in xray_settings_list(map, "vnext")? {
-        let (host, port) = xray_endpoint(vnext)?;
-        let user = first_object(vnext, "users").ok_or("xray: vless vnext without users")?;
-        let credential = str_field(user, "id")
-            .ok_or("xray: vless user without id")?
-            .to_string();
-        let mut params = Vec::new();
-        if let Some(flow) = str_field(user, "flow") {
-            push_param(&mut params, true, "flow", flow);
+        endpoints += 1;
+        let Ok((host, port)) = xray_endpoint(vnext) else {
+            tracing::debug!("sing-box: xray vless vnext without an endpoint, skipped");
+            continue;
+        };
+        let mut built = 0usize;
+        for user in xray_users(vnext) {
+            let Some(id) = str_field(user, "id") else {
+                tracing::debug!("sing-box: xray vless user without id, skipped");
+                continue;
+            };
+            let mut params = Vec::new();
+            if let Some(flow) = str_field(user, "flow") {
+                push_param(&mut params, true, "flow", flow);
+            }
+            if let Some(encryption) = str_field(user, "encryption")
+                && encryption != "none"
+            {
+                push_param(&mut params, true, "encryption", encryption);
+            }
+            if let Some(stream) = map.get("streamSettings").and_then(Value::as_object) {
+                xray_stream_params(stream, "type", Some(("security", "tls")), &mut params);
+            }
+            passthrough(map, XRAY_TOP_LEVEL_CONSUMED, &mut params);
+            // `finish` rejects (among others) a credential carrying a line
+            // break, which is this one user only; propagating it would
+            // discard the entries of every other endpoint.
+            match finish(
+                Scheme::Vless,
+                name,
+                host.clone(),
+                port,
+                id.to_string(),
+                params,
+            ) {
+                Ok(entry) => {
+                    entries.push(entry);
+                    built += 1;
+                }
+                Err(message) => {
+                    tracing::debug!(error = %message, "sing-box: xray vless user rejected, skipped")
+                }
+            }
         }
-        if let Some(encryption) = str_field(user, "encryption")
-            && encryption != "none"
-        {
-            push_param(&mut params, true, "encryption", encryption);
+        if built == 0 {
+            tracing::debug!(host = %host, "sing-box: xray vless vnext without a usable user");
         }
-        if let Some(stream) = map.get("streamSettings").and_then(Value::as_object) {
-            xray_stream_params(stream, "type", Some(("security", "tls")), &mut params);
-        }
-        passthrough(map, XRAY_TOP_LEVEL_CONSUMED, &mut params);
-        entries.push(finish(Scheme::Vless, name, host, port, credential, params)?);
+    }
+    // An endpoint that yielded nothing costs only itself, and the outbound
+    // is counted as invalid only when *no* endpoint produced an entry:
+    // bailing out of the loop used to throw away the entries already built
+    // and charge a single invalid for the whole outbound.
+    if endpoints > 0 && entries.is_empty() {
+        return Err("xray: vless vnext without a usable user".to_string());
     }
     Ok(entries)
 }
 
 fn xray_vmess(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
     let mut entries = Vec::new();
+    let mut endpoints = 0usize;
     for vnext in xray_settings_list(map, "vnext")? {
-        let (host, port) = xray_endpoint(vnext)?;
-        let user = first_object(vnext, "users").ok_or("xray: vmess vnext without users")?;
-        let credential = str_field(user, "id")
-            .ok_or("xray: vmess user without id")?
-            .to_string();
-        let mut params = Vec::new();
-        if let Some(scy) = str_field(user, "security") {
-            push_param(&mut params, true, "scy", scy);
+        endpoints += 1;
+        let Ok((host, port)) = xray_endpoint(vnext) else {
+            tracing::debug!("sing-box: xray vmess vnext without an endpoint, skipped");
+            continue;
+        };
+        let mut built = 0usize;
+        for user in xray_users(vnext) {
+            let Some(id) = str_field(user, "id") else {
+                tracing::debug!("sing-box: xray vmess user without id, skipped");
+                continue;
+            };
+            let mut params = Vec::new();
+            if let Some(scy) = str_field(user, "security") {
+                push_param(&mut params, true, "scy", scy);
+            }
+            if let Some(aid) = user.get("alterId") {
+                push_param(&mut params, true, "aid", json_to_param_value(aid));
+            }
+            if let Some(encryption) = str_field(user, "encryption")
+                && encryption != "none"
+            {
+                push_param(&mut params, true, "encryption", encryption);
+            }
+            if let Some(stream) = map.get("streamSettings").and_then(Value::as_object) {
+                // vmess JSON spells TLS as `tls: "tls"`.
+                xray_stream_params(stream, "net", Some(("tls", "tls")), &mut params);
+            }
+            passthrough(map, XRAY_TOP_LEVEL_CONSUMED, &mut params);
+            match finish(
+                Scheme::Vmess,
+                name,
+                host.clone(),
+                port,
+                id.to_string(),
+                params,
+            ) {
+                Ok(entry) => {
+                    entries.push(entry);
+                    built += 1;
+                }
+                Err(message) => {
+                    tracing::debug!(error = %message, "sing-box: xray vmess user rejected, skipped")
+                }
+            }
         }
-        if let Some(aid) = user.get("alterId") {
-            push_param(&mut params, true, "aid", json_to_param_value(aid));
+        if built == 0 {
+            tracing::debug!(host = %host, "sing-box: xray vmess vnext without a usable user");
         }
-        if let Some(encryption) = str_field(user, "encryption")
-            && encryption != "none"
-        {
-            push_param(&mut params, true, "encryption", encryption);
-        }
-        if let Some(stream) = map.get("streamSettings").and_then(Value::as_object) {
-            // vmess JSON spells TLS as `tls: "tls"`.
-            xray_stream_params(stream, "net", Some(("tls", "tls")), &mut params);
-        }
-        passthrough(map, XRAY_TOP_LEVEL_CONSUMED, &mut params);
-        entries.push(finish(Scheme::Vmess, name, host, port, credential, params)?);
+    }
+    if endpoints > 0 && entries.is_empty() {
+        return Err("xray: vmess vnext without a usable user".to_string());
     }
     Ok(entries)
 }
 
 fn xray_trojan(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
     let mut entries = Vec::new();
+    let mut servers = 0usize;
     for server in xray_settings_list(map, "servers")? {
-        let (host, port) = xray_endpoint(server)?;
-        let credential = str_field(server, "password")
-            .ok_or("xray: trojan server without password")?
-            .to_string();
+        servers += 1;
+        // A malformed element costs only itself (log-and-skip); the
+        // `?` used to end the whole loop and discard the entries already
+        // built for the elements before it.
+        let (host, port) = match xray_endpoint(server) {
+            Ok(endpoint) => endpoint,
+            Err(message) => {
+                tracing::debug!(error = %message, "sing-box: xray trojan server without an endpoint, skipped");
+                continue;
+            }
+        };
+        let Some(credential) = str_field(server, "password") else {
+            tracing::debug!("sing-box: xray trojan server without password, skipped");
+            continue;
+        };
         let mut params = Vec::new();
         if let Some(stream) = map.get("streamSettings").and_then(Value::as_object) {
             xray_stream_params(stream, "type", Some(("security", "tls")), &mut params);
         }
         passthrough(map, XRAY_TOP_LEVEL_CONSUMED, &mut params);
-        entries.push(finish(
+        match finish(
             Scheme::Trojan,
             name,
             host,
             port,
-            credential,
+            credential.to_string(),
             params,
-        )?);
+        ) {
+            Ok(entry) => entries.push(entry),
+            Err(message) => {
+                tracing::debug!(error = %message, "sing-box: xray trojan server rejected, skipped")
+            }
+        }
+    }
+    if servers > 0 && entries.is_empty() {
+        return Err("xray: trojan server without a usable endpoint".to_string());
     }
     Ok(entries)
 }
@@ -556,11 +639,20 @@ fn xray_ss(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, Stri
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut entries = Vec::new();
+    let mut servers = 0usize;
     for server in xray_settings_list(map, "servers")? {
-        let (host, port) = xray_endpoint(server)?;
-        let method = str_field(server, "method")
-            .ok_or("xray: shadowsocks server without method")?
-            .to_string();
+        servers += 1;
+        let (host, port) = match xray_endpoint(server) {
+            Ok(endpoint) => endpoint,
+            Err(message) => {
+                tracing::debug!(error = %message, "sing-box: xray shadowsocks server without an endpoint, skipped");
+                continue;
+            }
+        };
+        let Some(method) = str_field(server, "method") else {
+            tracing::debug!("sing-box: xray shadowsocks server without method, skipped");
+            continue;
+        };
         let password = str_field(server, "password").unwrap_or_default();
         let mut params = Vec::new();
         if let Some(plugin) = plugin {
@@ -572,41 +664,93 @@ fn xray_ss(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, Stri
             push_param(&mut params, true, "plugin", value);
         }
         passthrough(map, XRAY_TOP_LEVEL_CONSUMED, &mut params);
-        entries.push(finish(
+        match finish(
             Scheme::Ss,
             name,
             host,
             port,
             format!("{method}:{password}"),
             params,
-        )?);
+        ) {
+            Ok(entry) => entries.push(entry),
+            Err(message) => {
+                tracing::debug!(error = %message, "sing-box: xray shadowsocks server rejected, skipped")
+            }
+        }
+    }
+    if servers > 0 && entries.is_empty() {
+        return Err("xray: shadowsocks server without a usable endpoint".to_string());
     }
     Ok(entries)
 }
 
 fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
     let mut entries = Vec::new();
+    let mut servers = 0usize;
     for server in xray_settings_list(map, "servers")? {
-        let host = str_field(server, "address")
-            .or_else(|| str_field(server, "addr"))
-            .ok_or("xray: socks server without address")?
-            .to_string();
-        let port = numeric_field(server, "port")?;
-        let user = first_object(server, "users");
-        let username = user.and_then(|u| str_field(u, "user")).unwrap_or_default();
-        let password = user.and_then(|u| str_field(u, "pass")).unwrap_or_default();
-        let mut params = Vec::new();
-        passthrough(map, XRAY_TOP_LEVEL_CONSUMED, &mut params);
-        entries.push(finish(
-            Scheme::Socks5,
-            name,
-            host,
-            port,
-            format!("{username}:{password}"),
-            params,
-        )?);
+        servers += 1;
+        // Unlike the other dialects socks accepts an `addr` spelling too.
+        let (Some(host), Ok(port)) = (
+            str_field(server, "address").or_else(|| str_field(server, "addr")),
+            numeric_field(server, "port"),
+        ) else {
+            tracing::debug!("sing-box: xray socks server without an endpoint, skipped");
+            continue;
+        };
+        // A socks server without a `users` list is a no-auth proxy and still
+        // yields one entry; with a list, every user is a separate proxy.
+        let users: Vec<(String, String)> = xray_users(server)
+            .map(|user| {
+                (
+                    str_field(user, "user").unwrap_or_default().to_string(),
+                    str_field(user, "pass").unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let anonymous = users.is_empty();
+        let credentials = if anonymous {
+            vec![(String::new(), String::new())]
+        } else {
+            users
+        };
+        for (username, password) in credentials {
+            let mut params = Vec::new();
+            passthrough(map, XRAY_TOP_LEVEL_CONSUMED, &mut params);
+            match finish(
+                Scheme::Socks5,
+                name,
+                host.to_string(),
+                port,
+                format!("{username}:{password}"),
+                params,
+            ) {
+                Ok(entry) => entries.push(entry),
+                Err(message) => {
+                    tracing::debug!(error = %message, "sing-box: xray socks user rejected, skipped")
+                }
+            }
+        }
+    }
+    if servers > 0 && entries.is_empty() {
+        return Err("xray: socks server without a usable endpoint".to_string());
     }
     Ok(entries)
+}
+
+/// The `users` array of one Xray endpoint (`vnext[i].users`,
+/// `servers[i].users`) as objects, skipping non-object elements.
+///
+/// Every user is a distinct credential for the same endpoint, so each one
+/// becomes its own [`ProxyEntry`], the same treatment the sibling
+/// `vnext`/`servers` arrays already get, and the reason a multi-user
+/// outbound must not be collapsed to its first element. A junk element
+/// costs only itself (log-and-skip), not the credentials around it.
+fn xray_users(map: &Map<String, Value>) -> impl Iterator<Item = &Map<String, Value>> {
+    map.get("users")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
 }
 
 /// Outbound keys consumed structurally by every Xray builder; `mux` is a
@@ -788,9 +932,7 @@ fn xray_stream_params(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 // Shared helpers
-// ─────────────────────────────────────────────────────────────────────────
 
 /// Client-side knobs that describe the local dialer, not the proxy; dropped
 /// rather than passed through to keep DB rows and URI output clean.
@@ -888,13 +1030,6 @@ fn required_str(map: &Map<String, Value>, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("sing-box: missing field {key:?}"))
 }
 
-fn first_object<'a>(map: &'a Map<String, Value>, key: &str) -> Option<&'a Map<String, Value>> {
-    map.get(key)
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(Value::as_object)
-}
-
 fn numeric_field(map: &Map<String, Value>, key: &str) -> Result<u16, String> {
     match map.get(key) {
         Some(Value::Number(n)) => n
@@ -948,6 +1083,7 @@ fn json_to_param_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parsers::uri::percent_decode;
     use crate::parsers::{LineOutcome, parse_line, serialize};
 
     /// Compare entries ignoring `known` flags (they legitimately differ
@@ -974,7 +1110,7 @@ mod tests {
 
     /// The strong output→input guarantee: the sing-box encoder output
     /// parses back to a proxy with the same identity, re-encodes to the
-    /// identical document (the mapped TLS/transport fields survive — a lost
+    /// identical document (the mapped TLS/transport fields survive, a lost
     /// field would change the document), and the parsed entry itself
     /// round-trips through its URI form unchanged. Parameters the output
     /// schema cannot represent (unknown transports, client-side knobs)
@@ -1266,6 +1402,215 @@ mod tests {
         assert_eq!(result.invalid, 4);
     }
 
+    /// An Xray endpoint may carry several credentials in `users`; each is a
+    /// distinct proxy. Truncating to the first entry silently dropped the
+    /// rest, with no log line and no invalid counter to show for it.
+    #[test]
+    fn every_user_of_an_xray_endpoint_becomes_an_entry() {
+        let result = parse_payload(
+            r#"{"outbounds":[
+                {"tag":"p","protocol":"vless",
+                 "settings":{"vnext":[{"address":"1.2.3.4","port":443,
+                    "users":[{"id":"user-one","encryption":"none","flow":"xtls-rprx-vision"},
+                             {"id":"user-two","encryption":"none"}]}]},
+                 "streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"m","protocol":"vmess",
+                 "settings":{"vnext":[{"address":"5.6.7.8","port":443,
+                    "users":[{"id":"vm-one","alterId":0,"security":"auto"},
+                             {"id":"vm-two","alterId":0,"security":"auto"}]}]}},
+                {"tag":"k","protocol":"socks",
+                 "settings":{"servers":[{"address":"9.9.9.9","port":1080,
+                    "users":[{"user":"u1","pass":"p1"},{"user":"u2","pass":"p2"}]}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 6);
+        assert_eq!(result.invalid, 0);
+        assert_eq!(result.unsupported, 0);
+        let credentials: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|e| e.credential.as_str())
+            .collect();
+        assert_eq!(
+            credentials,
+            ["user-one", "user-two", "vm-one", "vm-two", "u1:p1", "u2:p2"]
+        );
+        // Per-user fields stay on their own entry.
+        assert_eq!(result.entries[0].param("flow"), Some("xtls-rprx-vision"));
+        assert_eq!(result.entries[1].param("flow"), None);
+        for entry in &result.entries {
+            assert_output_round_trip(entry);
+        }
+    }
+
+    /// One junk user element costs only itself: the credentials around it
+    /// still parse, and an outbound in which *no* endpoint yields a
+    /// credential is counted as invalid instead of vanishing quietly. An
+    /// endpoint whose users are all unusable is only a debug log when a
+    /// sibling endpoint did produce one.
+    #[test]
+    fn unusable_xray_users_are_skipped_not_fatal() {
+        let result = parse_payload(
+            r#"{"outbounds":[
+                {"tag":"mixed","protocol":"vless",
+                 "settings":{"vnext":[{"address":"1.2.3.4","port":443,
+                    "users":["junk",{"flow":"xtls-rprx-vision"},{"id":"good","encryption":"none"}]}]}},
+                {"tag":"none","protocol":"vless",
+                 "settings":{"vnext":[{"address":"5.6.7.8","port":443,
+                    "users":[{"flow":"xtls-rprx-vision"}]}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].credential, "good");
+        assert_eq!(result.invalid, 1);
+    }
+
+    /// An unusable `vnext` element costs only its own endpoint: the
+    /// entries already built for the earlier ones are kept. The early
+    /// return used to throw the accumulated entries away and count the
+    /// whole outbound as one `invalid`.
+    #[test]
+    fn an_unusable_vnext_element_keeps_the_earlier_endpoints() {
+        let result = parse_payload(
+            r#"{"outbounds":[
+                {"tag":"v","protocol":"vless",
+                 "settings":{"vnext":[
+                    {"address":"1.2.3.4","port":443,
+                     "users":[{"id":"good","encryption":"none"}]},
+                    {"address":"5.6.7.8","port":443,
+                     "users":[{"flow":"xtls-rprx-vision"}]}]}},
+                {"tag":"m","protocol":"vmess",
+                 "settings":{"vnext":[
+                    {"address":"9.9.9.9","port":443,
+                     "users":[{"id":"vm-good","alterId":0,"security":"auto"}]},
+                    {"address":"8.8.8.8","port":443,
+                     "users":[{"alterId":0}]}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.invalid, 0);
+        assert_eq!(result.entries[0].credential, "good");
+        assert_eq!(result.entries[0].host, "1.2.3.4");
+        assert_eq!(result.entries[1].credential, "vm-good");
+        assert_eq!(result.entries[1].host, "9.9.9.9");
+    }
+
+    /// A `vnext` element that is not a usable endpoint costs only itself:
+    /// the entries already built for the earlier ones are kept. The
+    /// `?` on the endpoint used to propagate out of the loop and throw
+    /// them away, the same data loss the unusable-user case had.
+    #[test]
+    fn a_malformed_vnext_element_keeps_the_earlier_endpoints() {
+        let result = parse_payload(
+            r#"{"outbounds":[
+                {"tag":"v","protocol":"vless",
+                 "settings":{"vnext":[
+                    {"address":"1.2.3.4","port":443,
+                     "users":[{"id":"good","encryption":"none"}]},
+                    {"port":443,"users":[{"id":"no-address","encryption":"none"}]},
+                    {"address":"7.7.7.7","users":[{"id":"no-port","encryption":"none"}]}]}},
+                {"tag":"m","protocol":"vmess",
+                 "settings":{"vnext":[
+                    {"address":"9.9.9.9","port":443,
+                     "users":[{"id":"vm-good","alterId":0,"security":"auto"}]},
+                    {"users":[{"id":"vm-nothing","alterId":0}]}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.invalid, 0);
+        assert_eq!(result.entries[0].credential, "good");
+        assert_eq!(result.entries[1].credential, "vm-good");
+    }
+
+    /// An outbound where no endpoint yields a usable entry is still
+    /// counted as invalid rather than vanishing quietly.
+    #[test]
+    fn a_fully_malformed_vnext_outbound_is_counted_invalid() {
+        let result = parse_payload(
+            r#"{"outbounds":[
+                {"tag":"v","protocol":"vless",
+                 "settings":{"vnext":[
+                    {"port":443,"users":[{"id":"no-address","encryption":"none"}]}]}},
+                {"tag":"m","protocol":"vmess",
+                 "settings":{"vnext":[{"users":[{"id":"nothing"}]}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 0);
+        assert_eq!(result.invalid, 2);
+    }
+
+    /// The same rule for the `settings.servers` dialect, which the vnext
+    /// fix had left untouched: a `servers[i]` element missing its
+    /// endpoint or credential used to propagate its `Err` out of the loop
+    /// and discard every entry built for the earlier elements.
+    #[test]
+    fn a_malformed_xray_server_element_keeps_the_earlier_endpoints() {
+        let result = parse_payload(
+            r#"{"outbounds":[
+                {"tag":"t","protocol":"trojan",
+                 "settings":{"servers":[
+                    {"address":"1.2.3.4","port":443,"password":"good"},
+                    {"address":"5.6.7.8","port":443}]}},
+                {"tag":"s","protocol":"shadowsocks",
+                 "settings":{"servers":[
+                    {"address":"9.9.9.9","port":8388,"method":"aes-256-gcm","password":"pw"},
+                    {"address":"8.8.8.8","port":8388,"password":"no-method"}]}},
+                {"tag":"k","protocol":"socks",
+                 "settings":{"servers":[
+                    {"address":"7.7.7.7","port":1080,"users":[{"user":"u","pass":"p"}]},
+                    {"port":1080}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.invalid, 0);
+        assert_eq!(result.entries[0].credential, "good");
+        assert_eq!(result.entries[1].credential, "aes-256-gcm:pw");
+        assert_eq!(result.entries[2].credential, "u:p");
+    }
+
+    /// …and an outbound where no element is usable is still invalid.
+    #[test]
+    fn a_fully_malformed_xray_servers_outbound_is_counted_invalid() {
+        let result = parse_payload(
+            r#"{"outbounds":[
+                {"tag":"t","protocol":"trojan",
+                 "settings":{"servers":[
+                    {"address":"1.2.3.4","port":443},
+                    {"address":"5.6.7.8","port":443,"password":"good"},
+                    {"port":443}]}},
+                {"tag":"s","protocol":"shadowsocks",
+                 "settings":{"servers":[{"password":"no-endpoint"}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].credential, "good");
+        assert_eq!(result.invalid, 1);
+    }
+
+    /// A sing-box path is decoded text; a raw `&` or `#` in it must not
+    /// spawn a bogus parameter or swallow the name when the entry is
+    /// serialized back to a URI.
+    #[test]
+    fn decoded_values_with_query_delimiters_survive_uri_serialization() {
+        let entry = parse_one(
+            r#"{"outbounds":[{"type":"vless","tag":"n","server":"h.example.com","server_port":443,
+                "uuid":"u1",
+                "transport":{"type":"ws","path":"/search?q=1&host=evil",
+                             "headers":{"Host":"ws.example.com"}}}]}"#,
+        );
+        let line = serialize(&entry);
+        assert!(line.contains("path=/search?q=1%26host=evil"), "{line}");
+        let LineOutcome::Parsed(back) = parse_line(&line) else {
+            panic!("serialized entry no longer parses: {line}");
+        };
+        assert_eq!(back.params.len(), 3, "{back:?}");
+        assert_eq!(back.name, "n");
+        assert_eq!(
+            percent_decode(back.param("path").unwrap()),
+            "/search?q=1&host=evil"
+        );
+    }
+
     #[test]
     fn payload_without_outbounds_is_an_error() {
         assert!(parse_payload(r#"{"dns":{}}"#).is_err());
@@ -1312,12 +1657,10 @@ mod tests {
         assert_eq!(result.invalid, 1);
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // Fixture tests against the real sing-box/Xray samples `test-sing.txt`
     // (single Xray config) and `test-sing2.txt` (v2rayN share array). The
     // fixtures are gitignored (real credentials) and never committed;
     // these tests skip themselves when the files are absent.
-    // ─────────────────────────────────────────────────────────────────────
 
     fn fixture_payload(name: &str) -> Option<String> {
         std::fs::read_to_string(

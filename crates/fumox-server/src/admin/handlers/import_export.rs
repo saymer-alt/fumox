@@ -6,8 +6,15 @@
 //! receive fresh `nanoid(12)` ids, profile composition is remapped onto the
 //! new source ids, and existing rows are never overwritten. Slug collisions
 //! with the database (or within the file) drop the slug rather than the
-//! object; references to sources absent from the file are excluded from the
-//! composition. Both cases surface as warnings, not errors.
+//! object; a source and a profile live in separate slug name-spaces (one
+//! UNIQUE column each), so the same slug on both is kept on both. References
+//! to sources absent from the file are excluded from the composition. Both
+//! cases surface as warnings, not errors. A reference
+//! repeated inside one profile is kept once (the composition is keyed by
+//! source, a repeat would abort the insert after the profile row was
+//! already written). Two *source rows* sharing one reference are a hard
+//! error: the reference binds them together, so the file does not say
+//! which row a profile composition means.
 //!
 //! Validation mirrors the source/profile forms and is all-or-nothing: any
 //! hard error yields a 422 with the full list and writes nothing.
@@ -22,14 +29,14 @@ use crate::pipeline::CompiledPipeline;
 use askama::Template;
 use axum::extract::{ConnectInfo, Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use fumox_core::models::{self, Encoding, InputFormat, IpFamily, OutputFormat, Scheme};
 use fumox_core::repo::{profiles, proxies, sources};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
-use super::caps;
+use super::{SLUG_RE, caps, pipeline_size};
 
 /// Body of `POST /admin/import`. A typed `Form` extractor parses only the
 /// `payload` field (the admin router's `DefaultBodyLimit::max(1 MiB)` still
@@ -42,14 +49,10 @@ pub(in crate::admin) struct ImportPayloadForm {
     payload: String,
 }
 
-/// Slug format shared with the source/profile forms.
-const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
 /// Only schema version we understand today.
 const SUPPORTED_VERSION: u32 = 1;
 
-// ---------------------------------------------------------------------------
 // Wire format
-// ---------------------------------------------------------------------------
 
 /// Versioned export file. `ref` carries the original id so profile
 /// composition can be remapped onto fresh ids at import time; primary keys
@@ -115,11 +118,9 @@ struct ExportProfile {
     source_refs: Vec<String>,
 }
 
-// ---------------------------------------------------------------------------
 // Export
-// ---------------------------------------------------------------------------
 
-/// `GET /admin/export` — download the whole configuration as JSON.
+/// `GET /admin/export`, download the whole configuration as JSON.
 pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
 
@@ -199,9 +200,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
     response
 }
 
-// ---------------------------------------------------------------------------
 // Import
-// ---------------------------------------------------------------------------
 
 /// Outcome of a successful import for the summary panel.
 #[derive(Debug, Default)]
@@ -221,13 +220,16 @@ struct ImportTemplate {
     csrf: String,
     /// Hard validation errors (import aborted, nothing written).
     errors: Vec<String>,
+    /// The submitted payload echoed back on an error so a fix-and-retry
+    /// does not start from an empty textarea. Empty on a fresh page.
+    payload: String,
     /// Present only after a successful import.
     summary: Option<ImportSummary>,
     /// Absolute public URL of the «all alive» export link, token included.
     alive_url: String,
     /// Alive+linked proxy count right now (button context).
     alive_count: i64,
-    /// Absolute public URL of the «all ready» export link — the same
+    /// Absolute public URL of the «all ready» export link, the same
     /// shared token, the verified tier.
     ready_url: String,
     /// Ready+linked proxy count right now.
@@ -236,7 +238,7 @@ struct ImportTemplate {
 
 impl_i18n!(ImportTemplate);
 
-/// Inputs for [`render_page`] — bundled to keep the call sites compact
+/// Inputs for [`render_page`], bundled to keep the call sites compact
 /// and the function's signature below clippy's argument-count cap.
 struct RenderArgs<'a> {
     lang: Lang,
@@ -245,6 +247,7 @@ struct RenderArgs<'a> {
     headers: &'a HeaderMap,
     status: StatusCode,
     errors: Vec<String>,
+    payload: Option<String>,
     summary: Option<ImportSummary>,
 }
 
@@ -260,6 +263,7 @@ async fn render_page(state: &AdminState, args: RenderArgs<'_>) -> Response {
         headers,
         status,
         errors,
+        payload,
         summary,
     } = args;
     let token = match alive_export::ensure_token(&state.pool).await {
@@ -289,6 +293,7 @@ async fn render_page(state: &AdminState, args: RenderArgs<'_>) -> Response {
             active: "import",
             csrf: state.csrf_for(headers),
             errors,
+            payload: payload.unwrap_or_default(),
             summary,
             alive_url,
             alive_count,
@@ -299,7 +304,7 @@ async fn render_page(state: &AdminState, args: RenderArgs<'_>) -> Response {
     )
 }
 
-/// `GET /admin/import` — the import/export screen.
+/// `GET /admin/import`, the import/export screen.
 pub async fn import_form(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -316,13 +321,14 @@ pub async fn import_form(
             headers: &headers,
             status: StatusCode::OK,
             errors: Vec::new(),
+            payload: None,
             summary: None,
         },
     )
     .await
 }
 
-/// `POST /admin/import` — validate then create-new.
+/// `POST /admin/import`, validate then create-new.
 pub async fn import_submit(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -346,6 +352,7 @@ pub async fn import_submit(
                     headers: &headers,
                     status: StatusCode::UNPROCESSABLE_ENTITY,
                     errors,
+                    payload: Some(payload),
                     summary: None,
                 },
             )
@@ -366,6 +373,7 @@ pub async fn import_submit(
                 headers: &headers,
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 errors,
+                payload: Some(payload),
                 summary: None,
             },
         )
@@ -384,6 +392,7 @@ pub async fn import_submit(
                 headers: &headers,
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 errors,
+                payload: Some(payload),
                 summary: None,
             },
         )
@@ -406,6 +415,7 @@ pub async fn import_submit(
                     headers: &headers,
                     status: StatusCode::OK,
                     errors: Vec::new(),
+                    payload: None,
                     summary: Some(summary),
                 },
             )
@@ -415,12 +425,18 @@ pub async fn import_submit(
     }
 }
 
-/// `POST /admin/import/alive-token` — issue a fresh token for the «all
+/// `POST /admin/import/alive-token`, issue a fresh token for the «all
 /// alive» export link; the previous link stops working immediately.
 pub async fn rotate_alive_token(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     match alive_export::rotate_token(&state.pool).await {
-        Ok(_) => Redirect::to("/admin/import").into_response(),
+        Ok(_) => {
+            // Audit line for a capability change that instantly invalidates
+            // both export links (one secret, shared by /export/alive and
+            // /export/ready). The token value itself is never logged.
+            tracing::info!("alive-export capability token rotated");
+            super::flash_redirect("/admin/import", lang.t("io.alive_rotated"), "ok")
+        }
         Err(err) => super::server_error(lang, &err),
     }
 }
@@ -429,7 +445,6 @@ pub async fn rotate_alive_token(State(state): State<AdminState>, headers: Header
 /// a (possibly empty) list of localized errors; any error aborts the import.
 async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
-    let slug_re = regex::Regex::new(SLUG_RE).expect("valid slug regex");
 
     // Row-count caps: one 1 MiB body could carry
     // thousands of rows, each triggering cache invalidation and (before the
@@ -458,13 +473,26 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
 
     // DNS-vet window: `vet_url` resolves every URL
     // inside the request; past the window the URLs are only statically
-    // validated — the fetch path re-vets every request anyway, so this is
+    // validated, the fetch path re-vets every request anyway, so this is
     // latency/DNS-traffic hygiene, not a security hole.
     let mut dns_budget = caps::IMPORT_DNS_VET;
     let mut dns_capped = false;
 
+    // A reference is the join key between a source row and the profile
+    // compositions naming it. Two rows sharing one are ambiguous: the
+    // write phase keys new ids by reference, so the second row would win
+    // and the first be silently orphaned. Reject the file instead of
+    // guessing which of the two the operator meant.
+    let mut seen_refs: HashSet<&str> = HashSet::new();
+
     for s in &file.sources {
         let ctx = format!("{} «{}»", lang.t("io.source_word"), s.name);
+        if !seen_refs.insert(s.reference.as_str()) {
+            errors.push(format!(
+                "{ctx}: {}",
+                lang.t("val.dup_ref").replace("{ref}", &s.reference)
+            ));
+        }
         if s.name.trim().is_empty() {
             errors.push(format!("{ctx}: {}", lang.t("val.required")));
         } else if s.name.chars().count() > 200 {
@@ -482,8 +510,8 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             let family = s
                 .ip_family
                 .unwrap_or_else(|| state.fetcher.default_family());
-            if state.admin.allow_private_urls {
-                // Nothing to reject at the DNS level — the fetch path still
+            if state.admin().allow_private_urls {
+                // Nothing to reject at the DNS level, the fetch path still
                 // re-vets on every request.
                 if let Err(issue) = fetcher::validate_url(&s.url) {
                     errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
@@ -504,7 +532,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         }
         if let Some(slug) = s.slug.as_deref()
             && !slug.is_empty()
-            && !slug_re.is_match(slug)
+            && !SLUG_RE.is_match(slug)
         {
             errors.push(format!("{ctx}: {}", lang.t("val.slug_format")));
         }
@@ -548,6 +576,16 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             }
         }
         if let Some(pipeline) = s.pipeline.as_ref() {
+            // Same cap the source form applies: the JSON is stored verbatim
+            // and re-rendered into every edit form, and the preview
+            // recompiles it on each keystroke.
+            if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
+                errors.push(format!(
+                    "{ctx}: {}",
+                    lang.t("val.field_too_long")
+                        .replace("{}", &caps::PIPELINE_BYTES.to_string())
+                ));
+            }
             for issue in CompiledPipeline::from_json(Some(pipeline))
                 .err()
                 .into_iter()
@@ -567,13 +605,13 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         }
         if let Some(slug) = p.slug.as_deref()
             && !slug.is_empty()
-            && !slug_re.is_match(slug)
+            && !SLUG_RE.is_match(slug)
         {
             errors.push(format!("{ctx}: {}", lang.t("val.slug_format")));
         }
         // Imported access tokens: a third-party file
         // must not plant a guessable secret on a public endpoint. Tokens
-        // shorter than the floor are hard errors — silently regenerating
+        // shorter than the floor are hard errors, silently regenerating
         // them would change what the operator expects the file to contain.
         if let Some(token) = p.access_token.as_deref()
             && !token.is_empty()
@@ -590,7 +628,24 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
                     .replace("{}", &caps::ACCESS_TOKEN.to_string())
             ));
         }
+        // The serve link embeds the token unescaped in `?token=…`, so
+        // only unreserved ASCII (the profile form's charset) round-trips.
+        if let Some(token) = p.access_token.as_deref()
+            && !token.is_empty()
+            && !token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+        {
+            errors.push(format!("{ctx}: {}", lang.t("val.token_format")));
+        }
         if let Some(pipeline) = p.pipeline.as_ref() {
+            if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
+                errors.push(format!(
+                    "{ctx}: {}",
+                    lang.t("val.field_too_long")
+                        .replace("{}", &caps::PIPELINE_BYTES.to_string())
+                ));
+            }
             for issue in CompiledPipeline::from_json(Some(pipeline))
                 .err()
                 .into_iter()
@@ -639,16 +694,23 @@ async fn apply_import(
     let mut summary = ImportSummary::default();
 
     // Slugs already present in the DB or used earlier in this file cannot be
-    // reused; the object is still created, just without a slug.
-    let mut taken_slugs: HashSet<String> = HashSet::new();
+    // reused; the object is still created, just without a slug. Sources and
+    // profiles are tracked separately: `slug` is UNIQUE per table, and each
+    // side resolves its own only, `profiles::resolve_token` behind
+    // `/sub/{id}` (serve.rs:234) and `sources::resolve_token` behind
+    // `/src/{id}` (serve.rs:295), each querying one table. The same slug is
+    // therefore legal on a source and on a profile, and must survive the
+    // round trip on both.
+    let mut taken_source_slugs: HashSet<String> = HashSet::new();
     for s in sources::list(&state.pool, false).await? {
         if let Some(slug) = s.slug {
-            taken_slugs.insert(slug);
+            taken_source_slugs.insert(slug);
         }
     }
+    let mut taken_profile_slugs: HashSet<String> = HashSet::new();
     for p in profiles::list(&state.pool, false).await? {
         if let Some(slug) = p.slug {
-            taken_slugs.insert(slug);
+            taken_profile_slugs.insert(slug);
         }
     }
 
@@ -658,7 +720,7 @@ async fn apply_import(
     for s in file.sources {
         let id = models::new_id();
         ref_to_id.insert(s.reference.clone(), id.clone());
-        let slug = claim_slug(s.slug, &mut taken_slugs, &s.name, lang, &mut summary);
+        let slug = claim_slug(s.slug, &mut taken_source_slugs, &s.name, lang, &mut summary);
         let source = models::Source {
             id: id.clone(),
             slug,
@@ -680,20 +742,39 @@ async fn apply_import(
             error_class: None,
         };
         sources::create(&state.pool, &source).await?;
-        state.caches.invalidate_source(&id).await;
+        // No cache invalidation: the id is brand new, no rendered output can
+        // reference it yet, and `last_fetched_at` is NULL, so the first
+        // ingest is due immediately.
         summary.sources_created += 1;
     }
 
     for p in file.profiles {
         let id = models::new_id();
-        let slug = claim_slug(p.slug, &mut taken_slugs, &p.name, lang, &mut summary);
+        let slug = claim_slug(
+            p.slug,
+            &mut taken_profile_slugs,
+            &p.name,
+            lang,
+            &mut summary,
+        );
 
         // Remap composition onto the freshly created source ids; references
         // to sources missing from the file are dropped with a warning.
+        // A reference repeated inside one profile collapses to its first
+        // position: `profile_sources` is keyed by (profile_id, source_id),
+        // so writing it twice aborts the whole composition insert, after
+        // the profile row was already committed, leaving an empty profile
+        // behind a 500. `/admin/export` never emits a duplicate ref, so
+        // this only ever sees a hand-edited file.
         let mut composition: Vec<(String, i64)> = Vec::new();
+        let mut placed: HashSet<String> = HashSet::new();
         for (position, reference) in p.source_refs.iter().enumerate() {
             match ref_to_id.get(reference) {
-                Some(new_id) => composition.push((new_id.clone(), position as i64)),
+                Some(new_id) if !placed.contains(new_id) => {
+                    placed.insert(new_id.clone());
+                    composition.push((new_id.clone(), position as i64));
+                }
+                Some(_) => {}
                 None => summary.warnings.push(
                     lang.t("io.warn_unknown_ref")
                         .replace("{profile}", &p.name)
@@ -779,6 +860,12 @@ mod tests {
         }
     }
 
+    /// Admin state on a throwaway database; the import path itself needs
+    /// nothing but the pool, the caches and the config.
+    async fn test_state() -> (fumox_core::tempdir_lite::TempDir, AdminState) {
+        crate::admin::test_admin_state(Default::default(), Default::default()).await
+    }
+
     #[test]
     fn export_file_round_trips_through_json() {
         let mut s1 = source("srcA0000000", "s1", Some("slug-a"));
@@ -850,36 +937,11 @@ mod tests {
     }
 
     /// F7/F8: import row caps and the
-    /// access-token floor are hard errors — nothing is written.
+    /// access-token floor are hard errors, nothing is written.
     #[tokio::test]
     async fn import_rejects_row_floods_and_short_tokens() {
-        // A minimal admin state (tests in admin::mod keep their own; this
-        // one only needs the fetcher defaults and the config).
-        let dir = std::env::temp_dir().join(format!("fumox-import-test-{}", models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        fumox_core::db::migrate(&pool).await.unwrap();
-        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-        std::mem::forget(refresh_rx);
-        let config = fumox_core::AppConfig::default();
-        let fetcher =
-            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.geo.dns_timeout());
-        let state = crate::admin::AdminState::new(
-            pool,
-            crate::cache::Caches::new(),
-            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
-            refresh_tx,
-            crate::scheduler::SchedulerState::new(1),
-            crate::events::EventBus::new(),
-            fetcher,
-            config,
-            fumox_core::config::ResolvedConfigPath::Missing,
-        );
+        let (_dir, state) =
+            crate::admin::test_admin_state(Default::default(), Default::default()).await;
         let lang = state.locales.default_lang();
 
         // 501 sources trip the row cap before any DNS work happens.
@@ -918,5 +980,318 @@ mod tests {
         };
         let errors = validate_import(&state, &lang, &file).await;
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A third-party token must round-trip unescaped in `?token=…`, so
+    /// validation mirrors the profile form's unreserved-ASCII rule.
+    #[tokio::test]
+    async fn import_rejects_tokens_outside_the_url_charset() {
+        let (_dir, state) = test_state().await;
+        let lang = state.locales.default_lang();
+
+        // Right length, so only the charset rule can reject these.
+        for token in [
+            format!("{} ", "a".repeat(caps::IMPORT_TOKEN_MIN)),
+            "ё".repeat(caps::IMPORT_TOKEN_MIN),
+        ] {
+            let mut planted = profile("p", None, &[]);
+            planted.access_token = Some(token.clone());
+            let file = ConfigExport {
+                version: SUPPORTED_VERSION,
+                exported_at: 1,
+                sources: Vec::new(),
+                profiles: vec![planted],
+            };
+            let errors = validate_import(&state, &lang, &file).await;
+            assert!(
+                !errors.is_empty(),
+                "token {token:?} must be rejected by the charset rule"
+            );
+        }
+
+        let mut ok = profile("p", None, &[]);
+        ok.access_token = Some(format!("{}-_.~", "a".repeat(caps::IMPORT_TOKEN_MIN)));
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: Vec::new(),
+            profiles: vec![ok],
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// `sources.slug` and `profiles.slug` are two independent UNIQUE
+    /// constraints on two tables, and each kind resolves its own only
+    /// (`profiles::resolve_token` for `/sub/{id}`, `sources::resolve_token`
+    /// for `/src/{id}`). The import must keep the two namespaces apart:
+    /// sharing a slug across the two kinds is legal, and collapsing them
+    /// into one "taken" set silently strips the profile's slug on a round
+    /// trip, repointing every client that was subscribed to `/sub/{slug}`
+    /// at `/sub/{id}`.
+    #[tokio::test]
+    async fn a_source_and_a_profile_may_hold_the_same_slug() {
+        let (_dir, state) = test_state().await;
+        let pool = state.pool.clone();
+        let lang = state.locales.default_lang();
+
+        // The DB itself allows one slug on both tables.
+        let now = models::now_ts();
+        let existing_source = models::Source {
+            id: models::new_id(),
+            slug: Some("main".into()),
+            name: "s0".into(),
+            url: "https://example.com/sub".into(),
+            enabled: true,
+            encoding: Encoding::Auto,
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 3600,
+            tags: None,
+            pipeline: None,
+            headers: None,
+            ip_family: None,
+            created_at: now,
+            updated_at: now,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        };
+        sources::create(&pool, &existing_source).await.unwrap();
+        let existing_profile = models::Profile {
+            id: models::new_id(),
+            slug: Some("main".into()),
+            access_token: None,
+            name: "p0".into(),
+            output_format: OutputFormat::UriList,
+            pipeline: None,
+            countries: Vec::new(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        profiles::create(&pool, &existing_profile).await.unwrap();
+
+        // Importing the same deployment again: every object collides
+        // with its own table's row, so nothing may keep a slug.
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![source("srcB0000000", "s1", Some("main"))],
+            profiles: vec![profile("p1", Some("main"), &["srcB0000000"])],
+        };
+        let summary = apply_import(&state, &lang, file).await.unwrap();
+        assert_eq!(summary.sources_created, 1);
+        assert_eq!(summary.profiles_created, 1);
+
+        let rows = profiles::list(&pool, false).await.unwrap();
+        let imported = rows.iter().find(|p| p.name == "p1").unwrap();
+        assert_eq!(
+            imported.slug, None,
+            "the profile collides with the stored profile of the same name-space"
+        );
+        let rows = sources::list(&pool, false).await.unwrap();
+        let imported = rows.iter().find(|s| s.name == "s1").unwrap();
+        assert_eq!(imported.slug, None, "collides with the stored source");
+
+        // A fresh deployment importing the same file: the source and the
+        // profile share a slug, and both must keep it, each in its own
+        // table.
+        let (_dir, fresh) = test_state().await;
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![source("srcA0000000", "s1", Some("main"))],
+            profiles: vec![profile("p1", Some("main"), &["srcA0000000"])],
+        };
+        apply_import(&fresh, &lang, file).await.unwrap();
+
+        let stored = profiles::get_by_slug(&fresh.pool, "main").await.unwrap();
+        assert!(
+            stored.is_some(),
+            "the profile must keep its slug: /sub/main would otherwise 404"
+        );
+        let stored = sources::get_by_slug(&fresh.pool, "main").await.unwrap();
+        assert!(stored.is_some(), "the source keeps its slug too");
+    }
+
+    /// A profile whose `sources` list names the same reference twice: the
+    /// write phase must not abort on the `(profile_id, source_id)` primary
+    /// key and leave the already-committed profile row without sources.
+    /// `/admin/export` never emits a duplicate ref, so this is the
+    /// hand-edited file the import screen accepts.
+    #[tokio::test]
+    async fn repeated_source_reference_stores_the_source_once() {
+        let (_dir, state) = test_state().await;
+        let pool = state.pool.clone();
+        let lang = state.locales.default_lang();
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![source("srcA0000000", "s1", None)],
+            profiles: vec![profile("p1", None, &["srcA0000000", "srcA0000000"])],
+        };
+
+        let summary = apply_import(&state, &lang, file)
+            .await
+            .expect("a repeated source reference must not abort the import");
+        assert_eq!(summary.profiles_created, 1);
+
+        let rows = profiles::list(&pool, false).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let composition = profiles::get_sources(&pool, &rows[0].id).await.unwrap();
+        assert_eq!(composition.len(), 1, "the ref is stored exactly once");
+    }
+
+    /// Two *source rows* sharing one `ref`: the write phase keys the fresh
+    /// ids by reference, so the second row would overwrite the first in
+    /// `ref_to_id` and the profile would bind only that one while the other
+    /// source is created and silently orphaned. Validation rejects the
+    /// ambiguity instead of picking a winner.
+    #[tokio::test]
+    async fn duplicate_source_reference_is_rejected() {
+        let (_dir, state) = test_state().await;
+        let lang = state.locales.default_lang();
+        let dup_text = lang.t("val.dup_ref").replace("{ref}", "srcA0000000");
+
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![
+                source("srcA0000000", "s1", None),
+                source("srcA0000000", "s2", None),
+            ],
+            profiles: vec![profile("p1", None, &["srcA0000000"])],
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(
+            errors.iter().any(|e| e.contains(&dup_text)),
+            "a reference used by two sources must be rejected: {errors:?}"
+        );
+
+        // Distinct references stay silent under the same rule, whatever the
+        // URLs vet to in this environment.
+        let file = ConfigExport {
+            sources: vec![
+                source("srcA0000000", "s1", None),
+                source("srcB0000000", "s2", None),
+            ],
+            ..file
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(
+            !errors.iter().any(|e| e.contains(&dup_text)),
+            "distinct references must not be flagged: {errors:?}"
+        );
+    }
+
+    /// The import path applies the same `PIPELINE_BYTES` cap the source and
+    /// profile forms do: the stored JSON is re-rendered into every edit form
+    /// and recompiled by the preview, so without the cap a file could plant
+    /// a pipeline up to the 1 MiB body limit. The rule set here is
+    /// semantically valid, so only the size may reject it.
+    #[tokio::test]
+    async fn imported_pipelines_respect_the_form_size_cap() {
+        let (_dir, state) = test_state().await;
+        let lang = state.locales.default_lang();
+
+        let rules: Vec<serde_json::Value> = (0..800)
+            .map(|i| {
+                serde_json::json!({
+                    "match": format!("^rule-{i}-{}", "x".repeat(80)),
+                    "replace": "r",
+                })
+            })
+            .collect();
+        let big = serde_json::json!({ "version": 1, "rename": rules });
+        assert!(
+            CompiledPipeline::from_json(Some(&big)).is_ok(),
+            "the oversized pipeline is semantically valid"
+        );
+        assert!(pipeline_size(&big) > caps::PIPELINE_BYTES);
+
+        let mut s = source("srcA0000000", "s1", None);
+        s.pipeline = Some(big.clone());
+        let mut p = profile("p1", None, &["srcA0000000"]);
+        p.pipeline = Some(big);
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![s],
+            profiles: vec![p],
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert_eq!(
+            errors.len(),
+            2,
+            "source and profile are both refused: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(|e| e.contains("65536")),
+            "the cap, not a pipeline semantic, is the reason: {errors:?}"
+        );
+
+        // A pipeline inside the cap still imports.
+        let mut s = source("srcA0000000", "s1", None);
+        s.pipeline = Some(serde_json::json!({ "version": 1 }));
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![s],
+            profiles: Vec::new(),
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// Rotating the export capability token is audited like every other
+    /// admin state change: an info line on the success path, without the
+    /// token value itself. The token is the shared secret of both export
+    /// links and rotation kills them instantly, so the log line is the
+    /// only trace an operator has when a link stops working.
+    #[tokio::test]
+    async fn rotate_alive_token_is_logged_without_the_token_value() {
+        let (_dir, state) = test_state().await;
+        let old = alive_export::ensure_token(&state.pool).await.unwrap();
+
+        // The same writer trick the scheduler tests use.
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let response = rotate_alive_token(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The rotation took effect: a fresh token replaced the old one.
+        let new = fumox_core::repo::meta_get(&state.pool, alive_export::TOKEN_KEY)
+            .await
+            .unwrap()
+            .expect("rotation must persist the fresh token");
+        assert_ne!(new, old);
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("alive-export capability token rotated"),
+            "the rotation must be audited: {logs}"
+        );
+        assert!(
+            !logs.contains(&old) && !logs.contains(&new),
+            "the token value itself must never be logged: {logs}"
+        );
     }
 }

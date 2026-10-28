@@ -6,39 +6,62 @@
   <title>{% block title %}{{ self.t("common.admin") }}{% endblock %} · Fumox</title>
   <link rel="stylesheet" href="/admin/static/app.css">
   <script src="/admin/static/htmx.min.js" defer></script>
+  {#- No-JS fallback for the destructive dialogs (source/profile delete,
+      proxies revive/cleanup/purge): a closed <dialog> is display:none and
+      showModal() never fires without JavaScript, so the POST forms inside
+      would be unreachable. When scripting is disabled, render dialogs as
+      plain inline panels (their forms are ordinary POSTs) and hide the
+      JS-only pieces: the showModal() triggers and the cancel buttons that
+      only call dialog.close(). With JavaScript enabled the contents of
+      <noscript> are not parsed, so the dialog UX is unchanged. -#}
+  <noscript>
+    <style>
+      dialog { display: block; position: static; margin: 16px 0; }
+      dialog button[type="button"] { display: none; }
+      button[aria-haspopup="dialog"] { display: none; }
+    </style>
+  </noscript>
 </head>
 <body>
   <div class="topbar">
     <span class="brand">Fumox</span>
-    <nav>
-      <a href="/admin" {% if active == "dashboard" %}class="active"{% endif %}>{{ self.t("nav.dashboard") }}</a>
-      <a href="/admin/sources" {% if active == "sources" %}class="active"{% endif %}>{{ self.t("nav.sources") }}</a>
-      <a href="/admin/profiles" {% if active == "profiles" %}class="active"{% endif %}>{{ self.t("nav.profiles") }}</a>
-      <a href="/admin/proxies" {% if active == "proxies" %}class="active"{% endif %}>{{ self.t("nav.proxies") }}</a>
-      <a href="/admin/probe" {% if active == "probe" %}class="active"{% endif %}>{{ self.t("nav.probe") }}</a>
-      <a href="/admin/settings" {% if active == "settings" %}class="active"{% endif %}>{{ self.t("nav.settings") }}</a>
-      <a href="/admin/logs/fetch" {% if active == "logs" %}class="active"{% endif %}>{{ self.t("nav.logs") }}</a>
-      <a href="/admin/import" {% if active == "import" %}class="active"{% endif %}>{{ self.t("nav.import") }}</a>
+    <nav aria-label="Primary">
+      <a href="/admin" {% if active == "dashboard" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.dashboard") }}</a>
+      <a href="/admin/sources" {% if active == "sources" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.sources") }}</a>
+      <a href="/admin/profiles" {% if active == "profiles" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.profiles") }}</a>
+      <a href="/admin/proxies" {% if active == "proxies" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.proxies") }}</a>
+      <a href="/admin/probe" {% if active == "probe" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.probe") }}</a>
+      <a href="/admin/settings" {% if active == "settings" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.settings") }}</a>
+      <a href="/admin/logs/fetch" {% if active == "logs" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.logs") }}</a>
+      <a href="/admin/import" {% if active == "import" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.import") }}</a>
     </nav>
     <span class="spacer"></span>
+    {# Live-update connection state. Hidden until the EventSource opens at
+       least once (no-JS browsers keep polling fragments and see nothing).
+       `data-state` drives the dot color in CSS; the text is announced by
+       role=status when the state flips. #}
+    <span class="sse-status" id="sse-status" role="status" hidden
+          data-state="stale"
+          data-live="{{ self.t("common.sse_live") }}"
+          data-stale="{{ self.t("common.sse_stale") }}">{{ self.t("common.sse_stale") }}</span>
     {# Theme switcher (day/night): the choice is stored in the fumox_theme
        cookie and rendered server-side as data-theme on <html>, so it works
        without JavaScript. The onclick appends the current path as `next`,
        same as the language switcher below. On narrow screens CSS swaps the
        text labels for the inline SVG sun/moon icons so the whole first
        topbar row fits. #}
-    <span class="lang-switch theme-switch">
+    <span class="lang-switch theme-switch" role="group" aria-label="{{ self.t("nav.theme") }}">
       <a href="/admin/set-theme?theme=light"
          aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
-         onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
-         {% if theme.is_light() %}class="active"{% endif %}>
+         onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
+         {% if theme.is_light() %}class="active" aria-current="true"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
         <span class="theme-label">{{ self.t("theme.light") }}</span>
       </a>
       <a href="/admin/set-theme?theme=dark"
          aria-label="{{ self.t("theme.dark") }}" title="{{ self.t("theme.dark") }}"
-         onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
-         {% if theme.is_dark() %}class="active"{% endif %}>
+         onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
+         {% if theme.is_dark() %}class="active" aria-current="true"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
         <span class="theme-label">{{ self.t("theme.dark") }}</span>
       </a>
@@ -47,11 +70,11 @@
        languages appear automatically. The onclick appends the current path
        as `next` so the user lands back on the same page; without JS the
        redirect falls back to the dashboard. #}
-    <span class="lang-switch">
+    <span class="lang-switch" role="group" aria-label="{{ self.t("nav.language") }}">
       {% for (code, _label) in langs %}
       <a href="/admin/set-lang?lang={{ code }}"
-         onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
-         {% if self.lang_code() == code.as_str() %}class="active"{% endif %}>{{ code | upper }}</a>
+         onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
+         {% if self.lang_code() == code.as_str() %}class="active" aria-current="true"{% endif %}>{{ code | upper }}</a>
       {% endfor %}
     </span>
     <form method="post" action="/admin/logout" class="inline">
@@ -65,7 +88,7 @@
   <div class="toast-wrap" id="toast-wrap"></div>
   <script>
     // Flash/toast: handlers send HX-Trigger: {"toast": {"message": ..., "level": ...}}.
-    // The message travels percent-encoded — header bytes are Latin-1 on the
+    // The message travels percent-encoded, header bytes are Latin-1 on the
     // wire, raw UTF-8 would arrive as mojibake.
     document.body.addEventListener('toast', function (e) {
       var wrap = document.getElementById('toast-wrap');
@@ -85,14 +108,45 @@
       setTimeout(function () { div.remove(); }, isError ? 10000 : 4000);
     });
 
+    // Flash toasts for the plain-browser path: action_response redirects
+    // carry `flash` / `flash_level` query parameters (percent-encoded) and
+    // the parameters are stripped from the URL immediately, so a refresh
+    // or a copied URL does not replay a stale message.
+    (function () {
+      var params = new URLSearchParams(location.search);
+      var flash = params.get('flash');
+      if (!flash) return;
+      document.body.dispatchEvent(new CustomEvent('toast', {
+        detail: { message: flash, level: params.get('flash_level') || 'ok' }
+      }));
+      params.delete('flash');
+      params.delete('flash_level');
+      var rest = params.toString();
+      history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
+    })();
+
     // SSE: push updates from the server. Each event is
     // re-broadcast on <body> as a namespaced DOM event so HTMX fragments
     // can react with hx-trigger="fumox:*". Polling fragments remain the
-    // no-JS fallback — SSE is a pure enhancement.
+    // no-JS fallback, SSE is a pure enhancement.
     (function () {
       if (!window.EventSource) return;
+      var statusEl = document.getElementById('sse-status');
+      function setStatus(state) {
+        if (!statusEl) return;
+        statusEl.setAttribute('data-state', state);
+        statusEl.textContent = state === 'live'
+          ? statusEl.getAttribute('data-live')
+          : statusEl.getAttribute('data-stale');
+        statusEl.hidden = false;
+      }
       var es = new EventSource('/admin/events');
-      ['fetch.started', 'fetch.done', 'fetch.failed', 'probe.stats', 'heartbeat']
+      es.addEventListener('open', function () { setStatus('live'); });
+      es.addEventListener('error', function () {
+        // EventSource reconnects on its own; show the gap meanwhile.
+        setStatus(es.readyState === EventSource.OPEN ? 'live' : 'stale');
+      });
+      ['fetch.started', 'fetch.done', 'fetch.failed']
         .forEach(function (name) {
           es.addEventListener(name, function (e) {
             var data = {};
@@ -113,21 +167,46 @@
       document.body.addEventListener('fumox:fetch.failed', refreshAfterFetch);
     })();
 
+    // Toggle swaps replace the button the user just activated (the form
+    // travels out-of-band with the badge), so keyboard focus falls to
+    // <body> after every click. Put it back on the re-created button, but
+    // only when focus was not moved elsewhere in the meantime.
+    (function () {
+      function restoreToggleFocus(event) {
+        var target = event.detail && event.detail.target;
+        if (!target || target.id !== 'enabled-badge') return;
+        if (document.activeElement !== document.body) return;
+        requestAnimationFrame(function () {
+          var form = document.getElementById('toggle-form');
+          var btn = form && form.querySelector('button[type="submit"]');
+          if (btn) btn.focus();
+        });
+      }
+      document.body.addEventListener('htmx:afterSwap', restoreToggleFocus);
+      document.body.addEventListener('htmx:oobAfterSwap', restoreToggleFocus);
+    })();
+
     // Local time: the server emits every
     // timestamp as <time class="ts" datetime="RFC3339 UTC">UTC text</time>.
     // The browser rewrites the text into the user's timezone, formatted in
-    // the panel language (<html lang>) — without JS the UTC text stays.
+    // the panel language (<html lang>), without JS the UTC text stays.
     // Re-run after every HTMX swap: fragments carry <time> elements too.
     // Idempotent: the text is always rebuilt from the datetime attribute.
     (function () {
       function localize(root) {
         if (!root.querySelectorAll) return;
         var lang = document.documentElement.lang || undefined;
-        var fmt;
+        var full, dayOnly;
         try {
-          fmt = new Intl.DateTimeFormat(lang, {
+          full = new Intl.DateTimeFormat(lang, {
             year: 'numeric', month: '2-digit', day: '2-digit',
             hour: '2-digit', minute: '2-digit', second: '2-digit'
+          });
+          // `time.ts.day` marks a calendar-day bucket (the ingest chart's
+          // columns): the time of day is always 00:00 and only crowds out
+          // the date in a 64px column, so those keep the date alone.
+          dayOnly = new Intl.DateTimeFormat(lang, {
+            year: 'numeric', month: '2-digit', day: '2-digit'
           });
         } catch (_) { return; }
         var zone = '';
@@ -139,6 +218,8 @@
           if (!attr) return;
           var stamp = new Date(attr);
           if (isNaN(stamp)) return;
+          var isDay = el.classList.contains('day');
+          var fmt = isDay ? dayOnly : full;
           var local = fmt.format(stamp);
           el.textContent = local;
           // Language-neutral tooltip: the original UTC instant and the zone used.
@@ -187,11 +268,59 @@
         if (section) syncSection(section);
       });
       // The widget is re-rendered by HTMX on preset / mode / preview
-      // refresh — re-run after every settle so the initial state matches
+      // refresh, re-run after every settle so the initial state matches
       // the rendered radios.
       document.body.addEventListener('htmx:afterSettle', function () {
         syncAll(document);
       });
+    })();
+
+    // Settings tabs: the panes swap on the radio's :checked, but
+    // `aria-selected` is server-rendered and would keep naming the tab the
+    // page loaded with. Mirror the radio onto the labels.
+    (function () {
+      function syncTabs() {
+        document.querySelectorAll('input.tab-input').forEach(function (input) {
+          var label = document.querySelector('label[for="' + input.id + '"]');
+          if (label) label.setAttribute('aria-selected', input.checked ? 'true' : 'false');
+        });
+      }
+      document.body.addEventListener('change', function (event) {
+        if (event.target instanceof HTMLInputElement && event.target.classList.contains('tab-input')) syncTabs();
+      });
+      syncTabs();
+    })();
+
+    // Rule counters: the lists are capped in height, so the number is the
+    // only way to see how many rules a section holds, and htmx changes the
+    // rows without a page render. Blank lines do not count, the rename
+    // editor always keeps one and it emits no rule.
+    (function () {
+      function filledRows(container) {
+        if (!container) return 0;
+        return Array.prototype.filter.call(
+          container.querySelectorAll('.ped-row'),
+          function (row) {
+            return Array.prototype.some.call(
+              row.querySelectorAll('input[type="text"]'),
+              function (input) { return input.value.trim() !== ''; }
+            );
+          }
+        ).length;
+      }
+      function syncRuleCounts() {
+        document.querySelectorAll('[data-ped-count]').forEach(function (badge) {
+          var which = badge.getAttribute('data-ped-count');
+          var count = filledRows(
+            document.querySelector(which === 'rename' ? '#ped-rows' : '#ped-drop-rows')
+          );
+          badge.textContent = String(count);
+          if (count === 0) badge.setAttribute('hidden', '');
+          else badge.removeAttribute('hidden');
+        });
+      }
+      document.body.addEventListener('htmx:afterSettle', syncRuleCounts);
+      syncRuleCounts();
     })();
   </script>
 </body>

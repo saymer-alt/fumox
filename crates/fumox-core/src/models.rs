@@ -25,6 +25,13 @@ pub enum Scheme {
     Mieru,
     Socks5,
     Naive,
+    /// Snell (v1-v6), an obfuscated TCP proxy. meow-rs gained v6 in
+    /// 0.22.0 (`default`/`unshaped`/`unsafe-raw` record modes, pooled
+    /// connections); older servers keep their own version in `params`.
+    Snell,
+    /// AnyTLS, a TLS-shaped proxy that pads to traffic shape. Native in
+    /// meow-rs since 0.21.x.
+    AnyTls,
 }
 
 impl Scheme {
@@ -39,6 +46,8 @@ impl Scheme {
             Scheme::Mieru => "mieru",
             Scheme::Socks5 => "socks5",
             Scheme::Naive => "naive",
+            Scheme::Snell => "snell",
+            Scheme::AnyTls => "anytls",
         }
     }
 
@@ -54,6 +63,8 @@ impl Scheme {
             Scheme::Mieru,
             Scheme::Socks5,
             Scheme::Naive,
+            Scheme::Snell,
+            Scheme::AnyTls,
         ]
     }
 
@@ -86,6 +97,8 @@ impl FromStr for Scheme {
             "mieru" => Scheme::Mieru,
             "socks5" => Scheme::Socks5,
             "naive" => Scheme::Naive,
+            "snell" => Scheme::Snell,
+            "anytls" => Scheme::AnyTls,
             other => {
                 return Err(crate::Error::Parse(format!("unknown scheme: {other:?}")));
             }
@@ -98,7 +111,7 @@ impl FromStr for Scheme {
 ///
 /// `ready` is the tunnel-verified tier: it is
 /// assigned only while the latest T2 check succeeded and demoted back to
-/// `alive` by any failed T2 outcome. The tiers do not overlap — `alive`
+/// `alive` by any failed T2 outcome. The tiers do not overlap, `alive`
 /// means T1-alive without a fresh successful T2, `ready` means alive plus
 /// the confirmed tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -112,7 +125,7 @@ pub enum ProxyStatus {
 }
 
 impl ProxyStatus {
-    /// Every status in schema order — the source for admin UI option lists
+    /// Every status in schema order, the source for admin UI option lists
     /// (pipeline editor health filter).
     pub const ALL: [ProxyStatus; 5] = [
         ProxyStatus::Unknown,
@@ -160,7 +173,7 @@ impl FromStr for ProxyStatus {
 }
 
 /// Fetch error classification (`sources.error_class`, `fetch_log.error_class`).
-/// This is the only permitted vocabulary — the legacy
+/// This is the only permitted vocabulary, the legacy
 /// `stale|unreachable|…` set is removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -224,7 +237,42 @@ pub struct Param {
     pub known: bool,
 }
 
-/// A parsed, normalized proxy record — the unit of deduplication and of the
+/// Certificate-verification toggle spellings seen across the wire formats:
+/// the URI families ship `insecure` / `allowInsecure` / `skip-cert-verify`,
+/// sing-box links (tuic) the underscore `allow_insecure`. One list shared by
+/// every consumer, the fingerprint normalisation, the output writers and the
+/// forbid-insecure pipeline filter, so a feed spelling the toggle
+/// differently is never missed by one of them and two spellings of the same
+/// node collapse onto one deduplication key.
+pub const INSECURE_ALIASES: [&str; 4] = [
+    "insecure",
+    "allowinsecure",
+    "skip-cert-verify",
+    "allow_insecure",
+];
+
+/// Whether `value` spells a truthy toggle (`1` / `true` / `yes` / `on`,
+/// trimmed and case-insensitive). The one vocabulary shared by every toggle
+/// consumer: the certificate-verification aliases (the fingerprint
+/// normalisation, the output writers, the forbid-insecure filter), the
+/// parsers' Clash booleans and the writers' `param_truthy`. Splitting it
+/// made `allowInsecure=yes` keep a node that `allowInsecure=1` dropped and
+/// let the fingerprint merge a `yes` row with the secure variant.
+pub(crate) fn is_truthy_toggle(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Whether the parameter switches certificate verification off: one of the
+/// [`INSECURE_ALIASES`] spellings carrying a truthy value.
+pub fn is_insecure_param(param: &Param) -> bool {
+    INSECURE_ALIASES.contains(&param.key.to_ascii_lowercase().as_str())
+        && is_truthy_toggle(&param.value)
+}
+
+/// A parsed, normalized proxy record, the unit of deduplication and of the
 /// processing pipeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProxyEntry {
@@ -327,7 +375,7 @@ pub struct Source {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Preferred IP protocol family for fetching the URL.
     /// `None` inherits the deployment default (`[fetch] ip_family`); a set
-    /// family is strict — without an address of that family the fetch fails.
+    /// family is strict, without an address of that family the fetch fails.
     pub ip_family: Option<IpFamily>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -378,7 +426,7 @@ impl FromStr for IpFamily {
     }
 }
 
-/// Profile — a named combination of sources plus output rules (`profiles`).
+/// Profile, a named combination of sources plus output rules (`profiles`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     /// `nanoid(12)`; doubles as the `/sub/{id}` token when `slug` is unset.
@@ -392,7 +440,7 @@ pub struct Profile {
     pub pipeline: Option<serde_json::Value>,
     /// Country allowlist for `/sub`: ISO 3166-1 alpha-2 codes, uppercase.
     /// Empty = every country; while set, proxies with no determined country
-    /// stay out — the filter passes confirmed geo facts only.
+    /// stay out, the filter passes confirmed geo facts only.
     pub countries: Vec<String>,
     pub enabled: bool,
     pub created_at: i64,
@@ -514,7 +562,7 @@ impl FromStr for OutputFormat {
     }
 }
 
-/// Identifier alphabet for `nanoid(12)` (PLAN invariant).
+/// Identifier alphabet for `nanoid(12)`.
 pub const ID_ALPHABET: &[char; 64] = &[
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
     'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
@@ -527,8 +575,10 @@ pub fn new_id() -> String {
     nanoid::nanoid!(12, ID_ALPHABET)
 }
 
-/// Current Unix timestamp in seconds (UTC) — the timestamp convention used
-/// across the schema.
+/// Current Unix timestamp in seconds (UTC), the timestamp convention used
+/// across the schema. Panicking on a pre-epoch clock is deliberate: a clock
+/// error that far off would poison every stored timestamp, and failing the
+/// first write is easier to diagnose than silently negative ages.
 pub fn now_ts() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -539,6 +589,16 @@ pub fn now_ts() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truthy_toggle_vocabulary_is_1_true_yes_on() {
+        for truthy in ["1", "true", "yes", "on", " TRUE ", "Yes"] {
+            assert!(is_truthy_toggle(truthy), "{truthy:?} must be truthy");
+        }
+        for falsy in ["0", "false", "no", "off", "", " enabled"] {
+            assert!(!is_truthy_toggle(falsy), "{falsy:?} must be falsy");
+        }
+    }
 
     #[test]
     fn scheme_wire_names_round_trip() {

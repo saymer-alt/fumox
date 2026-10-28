@@ -1,4 +1,4 @@
-//! fumox-core — shared library for the Fumox proxy-subscription service.
+//! fumox-core, shared library for the Fumox proxy-subscription service.
 //!
 //! Contains configuration loading, database access helpers, domain models,
 //! fingerprinting, protocol parsers, geo enrichment and output-format
@@ -18,5 +18,6 @@ pub mod repo;
 pub mod ssrf;
 
 pub use config::{AppConfig, DEFAULT_CONFIG_PATH};
+pub use db::tempdir_lite;
 pub use error::{Error, Result};
 pub use models::{ProxyEntry, Scheme};

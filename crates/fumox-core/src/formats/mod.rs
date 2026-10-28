@@ -11,13 +11,13 @@ pub mod singbox;
 use std::collections::{HashMap, HashSet};
 
 /// Resolve duplicate names by suffixing later occurrences with « (2)»,
-/// « (3)» and so on (PLAN gap 14). The first occurrence keeps its name
+/// « (3)» and so on. The first occurrence keeps its name
 /// unchanged; suffixes themselves are checked against the taken set, so a
 /// literal «name (2)» in the input cannot shadow a generated one.
 ///
 /// The per-name counter is remembered across occurrences and never rewinds:
 /// restarting the probe at 1 for every entry made this O(k²) in the number of
-/// proxies sharing a name, and names come straight from an untrusted feed —
+/// proxies sharing a name, and names come straight from an untrusted feed ,
 /// 20 000 identical names cost 36 s of CPU inside a `/sub` render (security
 /// audit, 2026-09-05).
 pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -42,17 +42,12 @@ pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String>
     out
 }
 
-/// Whether the entry carries a truthy insecure toggle under any of its
-/// spelling aliases. Output formats only ever *reflect* an entry's own
-/// request: the entry's original spelling is kept verbatim.
-/// The underscore `allow_insecure` form is deliberately not here — it
-/// never arrives from parsed feeds that these writers target.
+/// Whether the entry carries a truthy insecure toggle under any of the
+/// spelling aliases ([`crate::models::INSECURE_ALIASES`]). Output formats
+/// only ever *reflect* an entry's own request: the entry's original spelling
+/// is kept verbatim in the emitted document.
 pub(crate) fn is_insecure(params: &[crate::models::Param]) -> bool {
-    const ALIASES: [&str; 3] = ["insecure", "allowinsecure", "skip-cert-verify"];
-    params.iter().any(|p| {
-        ALIASES.contains(&p.key.to_ascii_lowercase().as_str())
-            && matches!(p.value.trim().to_ascii_lowercase().as_str(), "1" | "true")
-    })
+    params.iter().any(crate::models::is_insecure_param)
 }
 
 /// Parameter value by case-insensitive key, empty values dropped.
@@ -66,14 +61,13 @@ pub(crate) fn param_value(entry: &crate::models::ProxyEntry, key: &str) -> Optio
 }
 
 /// Whether the parameter is present with a truthy value (`1`/`true`/`yes`/
-/// `on`, case-insensitive) — how Clash YAML booleans land in params.
+/// `on`, case-insensitive), how Clash YAML booleans land in params. The
+/// vocabulary is the shared [`crate::models::is_truthy_toggle`], so the
+/// writers agree with the fingerprint and the forbid-insecure filter.
 pub(crate) fn param_truthy(entry: &crate::models::ProxyEntry, key: &str) -> bool {
-    entry.param_ignore_case(key).is_some_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    entry
+        .param_ignore_case(key)
+        .is_some_and(crate::models::is_truthy_toggle)
 }
 
 /// Parameter as a list: YAML sequences (Clash-input `alpn: [h2, http/1.1]`)
@@ -83,7 +77,13 @@ pub(crate) fn param_list(entry: &crate::models::ProxyEntry, key: &str) -> Option
     if raw.trim().is_empty() {
         return None;
     }
-    if let Ok(serde_norway::Value::Sequence(seq)) = serde_norway::from_str(&raw) {
+    // Stored parameter values are feed-controlled and are re-parsed as YAML
+    // at serve time; refuse alias references first (quadratic memory
+    // amplification, see `parsers::reject_yaml_aliases`). A refused value
+    // falls through to the plain comma-split path, nothing else regresses.
+    if crate::parsers::reject_yaml_aliases(&raw).is_ok()
+        && let Ok(serde_norway::Value::Sequence(seq)) = serde_norway::from_str(&raw)
+    {
         let list: Vec<String> = seq
             .into_iter()
             .map(|v| match v {
@@ -114,6 +114,11 @@ pub(crate) fn param_map(
     key: &str,
 ) -> Option<serde_norway::Mapping> {
     let raw = entry.param_ignore_case(key)?;
+    // Same alias guard as `param_list`: the value is feed-controlled and
+    // re-parsed as YAML; on refusal the parameter keeps no mapping.
+    if crate::parsers::reject_yaml_aliases(raw.trim()).is_err() {
+        return None;
+    }
     match serde_norway::from_str(raw.trim()) {
         Ok(serde_norway::Value::Mapping(map)) if !map.is_empty() => Some(map),
         _ => None,
@@ -143,7 +148,7 @@ fn capitalize(key: &str) -> String {
 }
 
 /// Resolved transport network: the scheme's native URI key first (`type` for
-/// vless/trojan, `net` for vmess — passed by the caller), then the mihomo
+/// vless/trojan, `net` for vmess, passed by the caller), then the mihomo
 /// spelling `network` used by Clash input. Lower-cased.
 pub(crate) fn network_of(entry: &crate::models::ProxyEntry, uri_key: &str) -> Option<String> {
     param_value(entry, uri_key)
@@ -189,7 +194,15 @@ mod tests {
         assert!(is_insecure(&[param("allowInsecure", "1")]));
         assert!(is_insecure(&[param("insecure", "true")]));
         assert!(is_insecure(&[param("skip-cert-verify", " TRUE ")]));
+        assert!(is_insecure(&[param("allow_insecure", "1")]));
+        // The yes/on spellings the shared toggle vocabulary accepts: a
+        // `allowInsecure=yes` node must be emitted with the insecure marker
+        // like an `allowInsecure=1` one, not silently secured on output.
+        assert!(is_insecure(&[param("allowInsecure", "yes")]));
+        assert!(is_insecure(&[param("skip-cert-verify", "on")]));
         assert!(!is_insecure(&[param("allowInsecure", "0")]));
+        assert!(!is_insecure(&[param("allow_insecure", "false")]));
+        assert!(!is_insecure(&[param("insecure", "no")]));
         assert!(!is_insecure(&[param("sni", "example.com")]));
         assert!(!is_insecure(&[]));
     }

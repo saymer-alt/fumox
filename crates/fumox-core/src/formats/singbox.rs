@@ -4,7 +4,7 @@
 //! the rest with its defaults. An empty profile yields a valid
 //! `{"outbounds": []}` document.
 //! Outbound tags must be unique, so duplicate names get the same « (2)»
-//! suffixes as Clash output (PLAN gap 14).
+//! suffixes as Clash output.
 
 use crate::models::{ProxyEntry, Scheme};
 use serde_json::{Map, Value};
@@ -58,12 +58,14 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
             m.insert("server".into(), Value::String(entry.host.clone()));
             m.insert("server_port".into(), num(entry.port));
             m.insert("uuid".into(), Value::String(entry.credential.clone()));
-            m.insert(
-                "security".into(),
-                Value::String(entry.param("scy").unwrap_or("auto").to_string()),
-            );
-            let alter_id = entry
-                .param("aid")
+            // vmess JSON spells the cipher `scy` and the alter id `aid`, Clash
+            // YAML `cipher`/`alterId`; read both or the proxy silently defaults.
+            let cipher = super::param_value(entry, "scy")
+                .or_else(|| super::param_value(entry, "cipher"))
+                .unwrap_or_else(|| "auto".into());
+            m.insert("security".into(), Value::String(cipher));
+            let alter_id = super::param_value(entry, "aid")
+                .or_else(|| super::param_value(entry, "alterId"))
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
             // `as u16` silently truncated (aid=65536 became 0) while the
@@ -176,7 +178,12 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
                 m.insert("tls".into(), minimal_tls(entry));
             }
         }
-        Scheme::Naive | Scheme::Tuic | Scheme::Mieru => return None,
+        // sing-box has no outbound type for either, and guessing a field
+        // layout would hand it a config it cannot start. `None` is
+        // `filter_map`ped away, so they are left out of the export.
+        Scheme::Naive | Scheme::Tuic | Scheme::Mieru | Scheme::Snell | Scheme::AnyTls => {
+            return None;
+        }
     }
 
     Some(Value::Object(m))
@@ -205,11 +212,35 @@ pub fn encode_singbox(entries: &[ProxyEntry]) -> String {
 }
 
 /// vless/trojan/hysteria2-style entries want a TLS block when the entry
-/// advertises TLS or carries SNI/insecure markers.
+/// advertises TLS or carries SNI/insecure markers. Clash YAML spells the
+/// toggle `tls: true` and the SNI `servername`, so both spellings count.
 fn wants_tls(entry: &ProxyEntry) -> bool {
+    // An explicit `tls` toggle is authoritative wherever it appears: the
+    // mihomo boolean (`tls: false`) and the vmess string (`tls=tls`) both
+    // mean "this proxy is/is not wrapped". Deciding from the SNI instead
+    // would override a stated `tls: false` and emit a TLS outbound the
+    // Clash writer of the same entry never emits. A value that is
+    // neither truthy nor falsy is not a toggle at all, so the rules
+    // below still decide; `param_value` already drops an empty one.
+    if let Some(tls) = super::param_value(entry, "tls") {
+        match tls.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "tls" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
     matches!(entry.param("security").unwrap_or_default(), "tls")
-        || non_empty_param(entry, "sni").is_some()
+        || sni_of(entry).is_some()
         || super::is_insecure(&entry.params)
+}
+
+/// SNI under either spelling: the URI family's `sni` and the mihomo
+/// `servername` that Clash YAML carries. Reading only the first dropped
+/// the SNI of every Clash-sourced proxy.
+fn sni_of(entry: &ProxyEntry) -> Option<String> {
+    non_empty_param(entry, "sni")
+        .map(str::to_string)
+        .or_else(|| super::param_value(entry, "servername"))
 }
 
 fn security_is(entry: &ProxyEntry, want: &str) -> bool {
@@ -220,8 +251,8 @@ fn security_is(entry: &ProxyEntry, want: &str) -> bool {
 fn minimal_tls(entry: &ProxyEntry) -> Value {
     let mut tls = Map::new();
     tls.insert("enabled".into(), Value::Bool(true));
-    if let Some(sni) = non_empty_param(entry, "sni") {
-        tls.insert("server_name".into(), Value::String(sni.to_string()));
+    if let Some(sni) = sni_of(entry) {
+        tls.insert("server_name".into(), Value::String(sni));
     }
     if super::is_insecure(&entry.params) {
         tls.insert("insecure".into(), Value::Bool(true));
@@ -238,8 +269,8 @@ fn tls_object(entry: &ProxyEntry, enabled: bool, reality: bool) -> Option<Value>
     }
     let mut tls = Map::new();
     tls.insert("enabled".into(), Value::Bool(true));
-    if let Some(sni) = non_empty_param(entry, "sni") {
-        tls.insert("server_name".into(), Value::String(sni.to_string()));
+    if let Some(sni) = sni_of(entry) {
+        tls.insert("server_name".into(), Value::String(sni));
     }
     if super::is_insecure(&entry.params) {
         tls.insert("insecure".into(), Value::Bool(true));
@@ -409,6 +440,76 @@ mod tests {
         let transport = field(&v, "transport").unwrap();
         assert_eq!(str_field(transport, "type"), Some("grpc"));
         assert_eq!(str_field(transport, "service_name"), Some("svc"));
+    }
+
+    /// A Clash YAML item spells the TLS toggle `tls: true` and the SNI
+    /// `servername`; neither is a `sni`/`security` parameter, so a vless
+    /// proxy that came from Clash YAML used to be re-encoded as a
+    /// plaintext outbound with the SNI dropped.
+    #[test]
+    fn vless_from_clash_input_keeps_tls_and_servername() {
+        let yaml = "proxies:\n  - {name: c, type: vless, server: h.example.com, port: 443, \
+                    uuid: uuid-1, tls: true, servername: s.example.com, network: ws}\n";
+        let result = crate::parsers::clash::parse_payload(yaml).unwrap();
+        let e = &result.entries[0];
+
+        let v = entry_to_outbound(e).unwrap();
+        let tls = field(&v, "tls").expect("clash `tls: true` must survive the round trip");
+        assert_eq!(field(tls, "enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(str_field(tls, "server_name"), Some("s.example.com"));
+
+        // The Clash writer already read both spellings; the two outputs
+        // must not disagree about whether this proxy uses TLS.
+        let clash = crate::formats::clash::entry_to_clash(e).unwrap();
+        assert_eq!(clash.get("tls").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            clash.get("servername").and_then(|v| v.as_str()),
+            Some("s.example.com")
+        );
+    }
+
+    /// A Clash vmess item spells the cipher `cipher` and the alter id
+    /// `alterId`; the outbound writer must keep both, not default them.
+    #[test]
+    fn vmess_from_clash_input_keeps_cipher_and_alter_id() {
+        let yaml = "proxies:\n  - {name: c, type: vmess, server: h.example.com, port: 443, \
+                    uuid: uuid-2, cipher: aes-128-gcm, alterId: 4}\n";
+        let e = &crate::parsers::clash::parse_payload(yaml).unwrap().entries[0];
+
+        let v = entry_to_outbound(e).unwrap();
+        assert_eq!(str_field(&v, "security"), Some("aes-128-gcm"));
+        assert_eq!(field(&v, "alter_id").and_then(Value::as_u64), Some(4));
+
+        // The two writers must agree for the same entry.
+        let clash = crate::formats::clash::entry_to_clash(e).unwrap();
+        assert_eq!(
+            clash
+                .get(serde_norway::Value::from("cipher"))
+                .and_then(serde_norway::Value::as_str),
+            Some("aes-128-gcm")
+        );
+        assert_eq!(
+            clash
+                .get(serde_norway::Value::from("alterId"))
+                .and_then(serde_norway::Value::as_u64),
+            Some(4)
+        );
+    }
+
+    /// An explicit `tls: false` is the mihomo toggle and outranks the
+    /// SNI-implies-TLS rule below: the Clash writer of the same entry
+    /// emits no `tls` key at all, and the two outputs must not disagree
+    /// about whether this proxy is plaintext.
+    #[test]
+    fn clash_tls_false_outranks_a_stray_servername() {
+        let yaml = "proxies:\n  - {name: c, type: vless, server: h.example.com, port: 443, \
+                    uuid: uuid-1, tls: false, servername: s.example.com}\n";
+        let result = crate::parsers::clash::parse_payload(yaml).unwrap();
+        let e = &result.entries[0];
+
+        assert!(field(&entry_to_outbound(e).unwrap(), "tls").is_none());
+        let clash = crate::formats::clash::entry_to_clash(e).unwrap();
+        assert!(clash.get("tls").is_none());
     }
 
     #[test]
@@ -588,6 +689,11 @@ mod tests {
         assert!(entry_to_outbound(&entry(Scheme::Tuic, "c", &[])).is_none());
         assert!(entry_to_outbound(&entry(Scheme::Mieru, "c", &[])).is_none());
         assert!(entry_to_outbound(&entry(Scheme::Naive, "c", &[])).is_none());
+        // No sing-box outbound type exists for either: guessing a field
+        // layout would hand the client a config it cannot start, so the
+        // export leaves them out (clash/sing-box `is_supported` agree).
+        assert!(entry_to_outbound(&entry(Scheme::Snell, "c", &[])).is_none());
+        assert!(entry_to_outbound(&entry(Scheme::AnyTls, "c", &[])).is_none());
     }
 
     #[test]

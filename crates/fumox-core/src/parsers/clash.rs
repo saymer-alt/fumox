@@ -3,7 +3,7 @@
 //! Clash subscriptions carry proxies as structured YAML items under the
 //! `proxies:` key. Only the proxy list is consumed; proxy groups and rules
 //! are irrelevant to Fumox. Supported item types: `ss`, `trojan`, `vmess`,
-//! `hysteria2`, `vless`, `socks5` — items of any other type are skipped and
+//! `hysteria2`, `vless`, `socks5`, items of any other type are skipped and
 //! counted, never fatal (log-and-skip principle).
 //!
 //! Entries parsed from Clash have no source line; their `raw_line` stays
@@ -18,6 +18,15 @@ struct ClashTypeSpec {
     scheme: Scheme,
     /// Credential fields in the order they are joined with `:`.
     credential_fields: &'static [&'static str],
+    /// Whether an absent *first* credential field keeps its empty slot.
+    ///
+    /// It must when every part is optional, because the output writers
+    /// skip an empty part and read a colon-less credential as no
+    /// credential at all (socks5 `username`/`password`). It must not when
+    /// the first part is a method with a default: the shadowsocks writers
+    /// take the default only for a colon-less credential and would emit an
+    /// empty cipher for `":pw"`.
+    optional_credential_fields: bool,
     /// Lower-cased Clash field names recognized as defined parameters.
     known_fields: &'static [&'static str],
 }
@@ -25,12 +34,14 @@ struct ClashTypeSpec {
 const SS_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Ss,
     credential_fields: &["cipher", "password"],
+    optional_credential_fields: false,
     known_fields: &["udp", "plugin", "plugin-opts"],
 };
 
 const TROJAN_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Trojan,
     credential_fields: &["password"],
+    optional_credential_fields: false,
     known_fields: &[
         "sni",
         "skip-cert-verify",
@@ -46,6 +57,7 @@ const TROJAN_SPEC: ClashTypeSpec = ClashTypeSpec {
 const VMESS_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Vmess,
     credential_fields: &["uuid"],
+    optional_credential_fields: false,
     known_fields: &[
         "alterid",
         "cipher",
@@ -68,6 +80,7 @@ const VMESS_SPEC: ClashTypeSpec = ClashTypeSpec {
 const HYSTERIA2_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Hysteria2,
     credential_fields: &["password"],
+    optional_credential_fields: false,
     known_fields: &[
         "sni",
         "skip-cert-verify",
@@ -82,6 +95,7 @@ const HYSTERIA2_SPEC: ClashTypeSpec = ClashTypeSpec {
 const VLESS_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Vless,
     credential_fields: &["uuid"],
+    optional_credential_fields: false,
     known_fields: &[
         "tls",
         "skip-cert-verify",
@@ -102,7 +116,36 @@ const VLESS_SPEC: ClashTypeSpec = ClashTypeSpec {
 const SOCKS5_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Socks5,
     credential_fields: &["username", "password"],
+    // Every part is optional: the writers skip an empty one.
+    optional_credential_fields: true,
     known_fields: &["udp"],
+};
+
+/// `type: snell`: meow names the secret `psk`; it is a single required
+/// credential field, so the stored credential is the bare psk.
+const SNELL_SPEC: ClashTypeSpec = ClashTypeSpec {
+    scheme: Scheme::Snell,
+    credential_fields: &["psk"],
+    optional_credential_fields: false,
+    known_fields: &[
+        "version",
+        "mode",
+        "reuse",
+        "udp",
+        "obfs",
+        "obfs-host",
+        // The nested block a Clash feed spells obfs in; kept known so the
+        // Clash writer can re-emit it as a block rather than a scalar.
+        "obfs-opts",
+    ],
+};
+
+/// `type: anytls`: single required `password`, like trojan's.
+const ANYTLS_SPEC: ClashTypeSpec = ClashTypeSpec {
+    scheme: Scheme::AnyTls,
+    credential_fields: &["password"],
+    optional_credential_fields: false,
+    known_fields: &["sni", "udp", "skip-cert-verify", "insecure"],
 };
 
 /// Fields consumed structurally and never duplicated into params.
@@ -119,6 +162,11 @@ pub struct ClashParseResult {
 
 /// Parse a full Clash YAML subscription payload.
 pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
+    // Alias references are refused before parsing: the whole payload is
+    // attacker-controlled feed content and `serde_norway` re-materializes
+    // the anchor's subtree for every reference, an alias bomb amplifies
+    // quadratic memory out of a small payload (see `reject_yaml_aliases`).
+    super::reject_yaml_aliases(payload).map_err(|e| format!("clash: {e}"))?;
     let root: Value =
         serde_norway::from_str(payload).map_err(|e| format!("clash: invalid YAML: {e}"))?;
     let proxies = root
@@ -158,6 +206,8 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
         "hysteria2" => &HYSTERIA2_SPEC,
         "vless" => &VLESS_SPEC,
         "socks5" => &SOCKS5_SPEC,
+        "snell" => &SNELL_SPEC,
+        "anytls" => &ANYTLS_SPEC,
         _ => return Ok(None),
     };
 
@@ -169,15 +219,43 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     let host = string_field(map, "server")?;
     let port = numeric_field(map, "port")?;
 
-    let credential_parts: Vec<String> = spec
+    // The credential fields are joined in their declared order, which is
+    // the only contract the output writers have: they split on `:` and
+    // read a colon-less credential as "no credential at all".
+    //   - an absent field *after* the first present one always keeps its
+    //     empty slot, or the fields in front of it shift left and are
+    //     lost: a socks5 item with only `username` must store
+    //     `onlyuser:`, not `onlyuser`;
+    //   - an absent *leading* field keeps its slot only when every part
+    //     is optional (`optional_credential_fields`), because the writers
+    //     then skip the empty part. Shadowsocks reads the first part as
+    //     the cipher and takes its default only for a colon-less
+    //     credential, so there an absent leading field is dropped and an
+    //     ss item with only `password` stores `pw`;
+    //   - with nothing present the credential stays empty, so a
+    //     single-field scheme without its secret emits no userinfo.
+    let fields: Vec<Option<String>> = spec
         .credential_fields
         .iter()
-        .filter_map(|field| map.get(field).map(yaml_to_string))
+        .map(|field| map.get(field).map(yaml_to_string))
         .collect();
-    let credential = credential_parts.join(":");
+    let first = if spec.optional_credential_fields {
+        0
+    } else {
+        fields.iter().position(Option::is_some).unwrap_or(0)
+    };
+    let credential = if fields.iter().all(Option::is_none) {
+        String::new()
+    } else {
+        fields[first..]
+            .iter()
+            .map(|value| value.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(":")
+    };
 
     // A YAML scalar may legally contain a line break, but the URI
-    // serializers emit these two fields verbatim — one would split this proxy
+    // serializers emit these two fields verbatim, one would split this proxy
     // into several output lines and smuggle a foreign scheme past the
     // source's protocol allowlist. Reject the item; the caller counts it.
     // Parameter values are exempt: Clash keeps structured blocks (`ws-opts`,
@@ -293,11 +371,26 @@ proxies:
     skip-cert-verify: true
     obfs: salamander
     obfs-password: of-pass
-  - name: legacy-node
+  - name: snell-node
     type: snell
     server: 1.2.3.4
+    port: 44046
+    psk: snellpsk
+    version: 4
+    obfs-opts:
+      mode: http
+      host: bing.com
+  - name: anytls-node
+    type: anytls
+    server: 5.6.7.8
     port: 443
-    psk: abc
+    password: atls-pass
+    sni: atls.example.com
+    skip-cert-verify: true
+  - name: legacy-node
+    type: mieru
+    server: 9.9.9.9
+    port: 443
 proxy-groups:
   - name: auto
     type: url-test
@@ -307,8 +400,8 @@ proxy-groups:
     #[test]
     fn parses_supported_items_and_skips_the_rest() {
         let result = parse_payload(SAMPLE).unwrap();
-        assert_eq!(result.entries.len(), 2);
-        assert_eq!(result.unsupported, 1); // snell
+        assert_eq!(result.entries.len(), 4);
+        assert_eq!(result.unsupported, 1); // mieru
         assert_eq!(result.invalid, 0);
 
         let ss = &result.entries[0];
@@ -325,12 +418,151 @@ proxy-groups:
         assert_eq!(hy2.param("obfs"), Some("salamander"));
         assert_eq!(hy2.param("skip-cert-verify"), Some("true"));
         assert!(hy2.params.iter().find(|p| p.key == "sni").unwrap().known);
+
+        // snell: the psk is the whole credential, and the nested obfs block
+        // survives as a mapping the Clash writer can re-emit.
+        let snell = &result.entries[2];
+        assert_eq!(snell.scheme, Scheme::Snell);
+        assert_eq!(snell.host, "1.2.3.4");
+        assert_eq!(snell.port, 44046);
+        assert_eq!(snell.credential, "snellpsk");
+        assert_eq!(snell.param("version"), Some("4"));
+        assert!(
+            snell
+                .params
+                .iter()
+                .find(|p| p.key == "obfs-opts")
+                .unwrap()
+                .known
+        );
+
+        let anytls = &result.entries[3];
+        assert_eq!(anytls.scheme, Scheme::AnyTls);
+        assert_eq!(anytls.credential, "atls-pass");
+        assert_eq!(anytls.param("sni"), Some("atls.example.com"));
+        assert!(
+            anytls
+                .params
+                .iter()
+                .find(|p| p.key == "skip-cert-verify")
+                .unwrap()
+                .known
+        );
+    }
+
+    /// The two schemes must survive a Clash round-trip: a feed entry
+    /// parsed to an entry must render back to something meow-rs accepts,
+    /// otherwise a Clash subscription would lose them on every export.
+    #[test]
+    fn snell_and_anytls_round_trip_through_the_clash_writer() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: s, type: snell, server: 1.2.3.4, port: 44046, psk: psk, ",
+            "version: 6, mode: unshaped, reuse: true, ",
+            "obfs-opts: {mode: tls, host: bing.com}}\n",
+            "  - {name: a, type: anytls, server: 5.6.7.8, port: 443, ",
+            "password: pw, sni: a.example.com, skip-cert-verify: true}\n",
+        );
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.entries.len(), 2);
+
+        let snell = crate::formats::clash::entry_to_clash(&result.entries[0]).unwrap();
+        assert_eq!(snell.get("type").and_then(|v| v.as_str()), Some("snell"));
+        assert_eq!(snell.get("psk").and_then(|v| v.as_str()), Some("psk"));
+        assert_eq!(snell.get("version").and_then(|v| v.as_str()), Some("6"));
+        assert_eq!(snell.get("mode").and_then(|v| v.as_str()), Some("unshaped"));
+        assert_eq!(snell.get("reuse").and_then(|v| v.as_bool()), Some(true));
+        // meow-rs reads obfs as a block; the writer must not flatten it.
+        assert_eq!(
+            snell
+                .get("obfs-opts")
+                .and_then(|v| v.get("mode"))
+                .and_then(|v| v.as_str()),
+            Some("tls")
+        );
+        assert_eq!(
+            snell
+                .get("obfs-opts")
+                .and_then(|v| v.get("host"))
+                .and_then(|v| v.as_str()),
+            Some("bing.com")
+        );
+
+        let anytls = crate::formats::clash::entry_to_clash(&result.entries[1]).unwrap();
+        assert_eq!(anytls.get("type").and_then(|v| v.as_str()), Some("anytls"));
+        assert_eq!(anytls.get("password").and_then(|v| v.as_str()), Some("pw"));
+        assert_eq!(
+            anytls.get("sni").and_then(|v| v.as_str()),
+            Some("a.example.com")
+        );
+        assert_eq!(
+            anytls.get("skip-cert-verify").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
     fn payload_without_proxies_is_an_error() {
         assert!(parse_payload("mixed-port: 7890\n").is_err());
         assert!(parse_payload(":::").is_err());
+    }
+
+    /// `credential_fields` are joined positionally, so an absent field
+    /// must keep its empty slot. A socks5 item carrying only `username`
+    /// was stored as `onlyuser`, a string the output writers read as no
+    /// credentials at all, because they split on `:`.
+    #[test]
+    fn an_absent_credential_field_keeps_its_slot() {
+        let yaml =
+            "proxies:\n  - {name: s, type: socks5, server: h, port: 1080, username: onlyuser}\n";
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.entries[0].credential, "onlyuser:");
+    }
+
+    /// A leading absent field must not leave an empty slot: the output
+    /// writers split on `:` and would read `":pw"` as an empty cipher. A
+    /// trailing one must keep its slot, or the writers lose the field in
+    /// front of it (`onlyuser` carries no password to recover, and no
+    /// username either once the split fails).
+    #[test]
+    fn a_missing_cipher_keeps_the_password_usable() {
+        let yaml = "proxies:\n  - {name: s, type: ss, server: h, port: 8388, password: pw}\n";
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.entries[0].credential, "pw");
+        // The writers fall back to a default method only for a
+        // colon-less credential, so this is the shape they can use.
+        let clash = crate::formats::clash::entry_to_clash(&result.entries[0]).unwrap();
+        assert_eq!(
+            clash.get("cipher").and_then(|v| v.as_str()),
+            Some("chacha20-ietf-poly1305")
+        );
+        assert_eq!(clash.get("password").and_then(|v| v.as_str()), Some("pw"));
+    }
+
+    /// The mirror of the case above: a socks5 item carrying only a
+    /// `password` must keep its empty leading slot, because both writers
+    /// skip empty parts (`both parts are optional`, formats/clash.rs:136)
+    /// while a colon-less credential is read as no credentials at all.
+    #[test]
+    fn a_password_only_socks5_keeps_its_credential() {
+        let yaml =
+            "proxies:\n  - {name: s, type: socks5, server: h, port: 1080, password: onlypass}\n";
+        let result = parse_payload(yaml).unwrap();
+        let e = &result.entries[0];
+        assert_eq!(e.credential, ":onlypass");
+
+        let clash = crate::formats::clash::entry_to_clash(e).unwrap();
+        assert!(clash.get("username").is_none());
+        assert_eq!(
+            clash.get("password").and_then(|v| v.as_str()),
+            Some("onlypass")
+        );
+        let singbox = crate::formats::singbox::entry_to_outbound(e).unwrap();
+        assert!(singbox.get("username").is_none());
+        assert_eq!(
+            singbox.get("password").and_then(|v| v.as_str()),
+            Some("onlypass")
+        );
     }
 
     #[test]

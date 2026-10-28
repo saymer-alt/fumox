@@ -6,7 +6,7 @@
 //! unambiguously.
 
 use fumox_core::formats::clash::entry_to_clash_named;
-use fumox_core::models::Scheme;
+use fumox_core::models::{Param, ProxyEntry, Scheme};
 use fumox_core::repo::proxies::ProxyRow;
 use serde_norway::Value;
 
@@ -21,6 +21,8 @@ pub fn is_supported(scheme: Scheme) -> bool {
             | Scheme::Ss
             | Scheme::Hysteria2
             | Scheme::Socks5
+            | Scheme::Snell
+            | Scheme::AnyTls
     )
 }
 
@@ -37,26 +39,13 @@ fn num(value: i64) -> Value {
 /// Generate the full Clash config for one T2 batch, returning the YAML plus
 /// the ids of the rows actually included in it.
 ///
-/// Rows whose entry cannot be serialized are skipped (`None` from
-/// [`proxy_to_value`]) and their ids stay out of the returned list — the
-/// caller must journal them explicitly, otherwise the engine later answers
-/// "proxy not found" for them and the journal shows a misleading reason.
-///
-/// Listener ports are disabled (`0`): meow-rs only needs the proxy
-/// definitions to run delay tests. Proxy definitions come from the shared
-/// core mapping (the same one serving Clash subscriptions); the T2 policy
-/// on top is deterministic `fumox-{id}` names.
-///
-/// Certificate verification is **not** forced off here. Unlike T1, which
-/// only times a handshake, T2 builds a real authenticated tunnel and the
-/// generated YAML carries the proxy's own credential (uuid / password /
-/// `method:password`), so an unverified connection lets an on-path attacker
-/// impersonate the server and harvest it. `skip-cert-verify` is therefore
-/// emitted by the core mapping only for entries whose own parameters ask for
-/// it.
+/// Certificate verification is not forced off: T2 carries the proxy's own
+/// credential through the tunnel, so only entries whose own params ask for
+/// it get skip-cert-verify.
 pub fn generate(
     rows: &[ProxyRow],
     pins: &std::collections::HashMap<String, std::net::IpAddr>,
+    ipv6: bool,
 ) -> serde_norway::Result<(String, Vec<i64>)> {
     let mut included = Vec::new();
     let mut proxies = Vec::new();
@@ -76,21 +65,28 @@ pub fn generate(
         Value::String("log-level".into()),
         Value::String("silent".into()),
     );
+    // Emitted explicitly, never left to the engine default: meow-rs 0.22.0
+    // made `ipv6` effective end-to-end, so an omitted key is a real
+    // behavioural choice (IPv4-only) that `[meow].ipv6` should own.
+    root.insert(Value::String("ipv6".into()), Value::Bool(ipv6));
     root.insert(Value::String("proxies".into()), Value::Sequence(proxies));
     Ok((serde_norway::to_string(&Value::Mapping(root))?, included))
 }
 
 /// Map one DB row onto a Clash proxy definition; returns `None` for
-/// unsupported schemes (they are skipped, never fatal — log+skip policy).
+/// unsupported schemes (they are skipped, never fatal, log+skip policy).
 ///
 /// When `pins` contains an entry for the row's host, the entry is cloned with
 /// `host` replaced by the pinned IP literal before being serialized. This
 /// closes the vet/dial TOCTOU the same way T1 closes it: the proxy dials the
 /// vetted address, not whatever the OS resolver returns next. mihomo accepts
-/// an IP literal in `server`; certificate verification still runs against the
-/// entry's own `sni`/`servername` params (the proxy's hostname never enters
-/// the dial), and the per-entry `insecure`/`skip-cert-verify` flag drives
-/// opt-out from cert verification.
+/// an IP literal in `server`, and an IP is no certificate server name, so
+/// pinning also carries the proxy's own hostname into the scheme's
+/// server-name param (see [`carry_server_name`]): the entry's `sni` /
+/// `servername` when it has one, its pre-pin host when it does not, which is
+/// what keeps certificate verification (never forced off here, see
+/// [`generate`]) pointed at the right name while the hostname itself never
+/// enters the dial.
 fn proxy_to_value(
     row: &ProxyRow,
     pins: &std::collections::HashMap<String, std::net::IpAddr>,
@@ -101,9 +97,73 @@ fn proxy_to_value(
     }
     let mut entry = entry;
     if let Some(ip) = pins.get(&row.host) {
+        carry_server_name(&mut entry, &row.host);
         entry.host = ip.to_string();
     }
     entry_to_clash_named(&entry, &proxy_name(row.id))
+}
+
+/// The parameter the shared mapping reads the TLS server name from, as
+/// (destination key, source keys in the order they must be consulted), per
+/// scheme (`formats::clash`). `None` for the schemes the mapping never
+/// negotiates TLS with: ss has no TLS there, and mihomo reads no server name
+/// for a socks5 proxy.
+///
+/// For vless/vmess both spellings are copied into the same destination key
+/// and the later insert is the one that survives, so the mapping renders
+/// `servername` over `sni`; that is the order listed here, which keeps a
+/// pinned row on the name the unpinned row of the same entry renders.
+///
+/// For trojan/hysteria2 the mapping reads `sni` alone. `servername` is
+/// listed second as a fallback the mapping itself would drop, since it
+/// emits no name at all for such a row, reading it is deliberate, see
+/// [`carry_server_name`].
+fn server_name_sources(scheme: Scheme) -> Option<(&'static str, &'static [&'static str])> {
+    match scheme {
+        Scheme::Vless | Scheme::Vmess => Some(("servername", &["servername", "sni"])),
+        // AnyTLS is TLS to its server and meow reads `sni` alone, so it
+        // pins exactly like trojan.
+        Scheme::Trojan | Scheme::Hysteria2 | Scheme::AnyTls => {
+            Some(("sni", &["sni", "servername"]))
+        }
+        // Snell carries no top-level server name: its obfs name lives in
+        // `obfs-opts.host`, which the Clash mapping emits untouched, and
+        // with no obfs there is nothing to pin at all.
+        Scheme::Ss
+        | Scheme::Socks5
+        | Scheme::Naive
+        | Scheme::Tuic
+        | Scheme::Mieru
+        | Scheme::Snell => None,
+    }
+}
+
+/// The entry keeps exactly one server-name param, under the key
+/// `formats::clash` renders it: its own spelling, else the pre-pin host.
+/// A trojan/hysteria2 spelling only `servername` becomes `sni`, which the
+/// mapping would drop.
+fn carry_server_name(entry: &mut ProxyEntry, pre_pin_host: &str) {
+    let Some((key, sources)) = server_name_sources(entry.scheme) else {
+        return;
+    };
+    if pre_pin_host.parse::<std::net::IpAddr>().is_ok() {
+        return;
+    }
+    let name = sources
+        .iter()
+        .filter_map(|param| entry.param_ignore_case(param))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or(pre_pin_host)
+        .to_string();
+    entry.params.retain(|p| {
+        !p.key.eq_ignore_ascii_case("sni") && !p.key.eq_ignore_ascii_case("servername")
+    });
+    entry.params.push(Param {
+        key: key.to_string(),
+        value: name,
+        known: true,
+    });
 }
 
 #[cfg(test)]
@@ -143,6 +203,10 @@ mod tests {
             updated_at: 1,
         }
     }
+
+    /// (scheme, params, the key `formats::clash` renders the server name
+    /// under for that scheme)
+    type ServerNameCase = (Scheme, Vec<(&'static str, &'static str)>, &'static str);
 
     fn entry(scheme: Scheme, credential: &str, params: &[(&str, &str)]) -> ProxyEntry {
         ProxyEntry {
@@ -200,7 +264,7 @@ mod tests {
             ),
         ];
 
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies.len(), 6);
@@ -256,7 +320,7 @@ mod tests {
         assert!(!is_supported(Scheme::Naive));
 
         let rows = vec![row_from_entry(9, entry(Scheme::Tuic, "c", &[]))];
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert!(parsed["proxies"].as_sequence().unwrap().is_empty());
     }
@@ -276,7 +340,7 @@ mod tests {
                 entry(Scheme::Trojan, "pass", &[("skip-cert-verify", "true")]),
             ),
         ];
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
 
@@ -309,7 +373,7 @@ mod tests {
             "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
         );
 
-        let (yaml, included) = generate(&rows, &pins).unwrap();
+        let (yaml, included) = generate(&rows, &pins, false).unwrap();
         assert_eq!(included, vec![1]);
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
@@ -326,7 +390,7 @@ mod tests {
             1,
             entry(Scheme::Trojan, "pass", &[("sni", "t.example.com")]),
         )];
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
         assert_eq!(proxy["server"].as_str(), Some("h.example.com"));
@@ -349,10 +413,216 @@ mod tests {
             "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
         );
 
-        let (yaml, _) = generate(&rows, &pins).unwrap();
+        let (yaml, _) = generate(&rows, &pins, false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies[0]["server"].as_str(), Some("203.0.113.10"));
         assert_eq!(proxies[1]["server"].as_str(), Some("203.0.113.10"));
+    }
+
+    /// A pinned TLS entry with no `sni`/`servername` of its own, the shape
+    /// of a plain `trojan://pass@real.example.com:443` feed line, used to
+    /// be emitted as `server: <vetted ip>` and nothing else, so mihomo had
+    /// no name to verify the certificate against while verification itself
+    /// stayed on (T2 never forces `skip-cert-verify`). The pre-pin hostname
+    /// has to travel along as the server name, per scheme key.
+    #[test]
+    fn pinning_keeps_a_tls_server_name_for_a_bare_entry() {
+        let rows = vec![
+            row_from_entry(1, entry(Scheme::Trojan, "pass", &[])),
+            row_from_entry(2, entry(Scheme::Vless, "uuid", &[("security", "tls")])),
+            row_from_entry(3, entry(Scheme::Vmess, "uuid", &[("security", "tls")])),
+            row_from_entry(4, entry(Scheme::Hysteria2, "pw", &[])),
+        ];
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            "h.example.com".to_string(),
+            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
+        );
+
+        let (yaml, included) = generate(&rows, &pins, false).unwrap();
+        assert_eq!(included, vec![1, 2, 3, 4]);
+        let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+        let proxies = parsed["proxies"].as_sequence().unwrap();
+        for (proxy, name) in proxies
+            .iter()
+            .zip(["sni", "servername", "servername", "sni"])
+        {
+            assert_eq!(proxy["server"].as_str(), Some("203.0.113.10"));
+            assert_eq!(
+                proxy[name].as_str(),
+                Some("h.example.com"),
+                "the pre-pin hostname must survive as the TLS server name: {yaml}"
+            );
+            assert!(
+                proxy.get("skip-cert-verify").is_none(),
+                "the server name is what makes verification work, not turning it off"
+            );
+        }
+    }
+
+    /// Pinning supplies a server name the entry is missing; it must never
+    /// re-rank or shadow the one the entry already renders. The unpinned
+    /// render is the reference: the shared mapping copies `sni` and then
+    /// `servername` into the same `servername` key, the later insert wins,
+    /// and an empty value is not copied at all. Both renderings of the same
+    /// row have to agree on the name, or the pin silently changes which
+    /// certificate gets verified.
+    #[test]
+    fn pinning_never_re_ranks_the_entry_server_name() {
+        // (scheme, params, the key `formats::clash` renders the name under)
+        let cases: Vec<ServerNameCase> = vec![
+            // Both spellings: `servername` is the one the mapping keeps.
+            (
+                Scheme::Vless,
+                vec![
+                    ("security", "tls"),
+                    ("sni", "sni.example.com"),
+                    ("servername", "cdn.example.com"),
+                ],
+                "servername",
+            ),
+            // An empty `sni` is not copied by the mapping, so `servername`
+            // is the rendered name.
+            (
+                Scheme::Vless,
+                vec![
+                    ("security", "tls"),
+                    ("sni", ""),
+                    ("servername", "cdn.example.com"),
+                ],
+                "servername",
+            ),
+            // Only one spelling: it is the rendered name, whatever its key.
+            (
+                Scheme::Vless,
+                vec![("security", "tls"), ("sni", "sni.example.com")],
+                "servername",
+            ),
+            (
+                Scheme::Vmess,
+                vec![("security", "tls"), ("servername", "cdn.example.com")],
+                "servername",
+            ),
+            (Scheme::Trojan, vec![("sni", "sni.example.com")], "sni"),
+        ];
+
+        let rows: Vec<ProxyRow> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (scheme, params, _))| {
+                row_from_entry(i as i64 + 1, entry(*scheme, "c", params))
+            })
+            .collect();
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            "h.example.com".to_string(),
+            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
+        );
+
+        let (plain, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
+        let (pinned, _) = generate(&rows, &pins, false).unwrap();
+        let plain: serde_norway::Value = serde_norway::from_str(&plain).unwrap();
+        let pinned: serde_norway::Value = serde_norway::from_str(&pinned).unwrap();
+        let plain = plain["proxies"].as_sequence().unwrap();
+        let pinned = pinned["proxies"].as_sequence().unwrap();
+
+        let mut mismatches = Vec::new();
+        for (index, (_, _, key)) in cases.iter().enumerate() {
+            let before = plain[index][key].as_str();
+            assert!(before.is_some(), "row {index} must render a name unpinned");
+            if pinned[index][key].as_str() != before {
+                mismatches.push(format!(
+                    "row {index} ({key}): unpinned {before:?}, pinned {:?}",
+                    pinned[index][key].as_str()
+                ));
+            }
+            assert_eq!(pinned[index]["server"].as_str(), Some("203.0.113.10"));
+        }
+        assert!(
+            mismatches.is_empty(),
+            "pinning must not change the server name the mapping renders:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// The one place pinning does more than supply a missing name: a
+    /// trojan or hysteria2 that spells `servername` alone renders no name
+    /// at all (the mapping reads `sni` for those two schemes and nothing
+    /// else), and the pin turns that spelling into the `sni` mihomo reads,
+    /// so the certificate is verified against a name instead of the IP.
+    /// This is the exception [`carry_server_name`] documents.
+    #[test]
+    fn pinning_supplies_a_sni_the_mapping_would_drop() {
+        let rows = vec![
+            row_from_entry(
+                1,
+                entry(Scheme::Trojan, "pass", &[("servername", "cdn.example.com")]),
+            ),
+            row_from_entry(
+                2,
+                entry(
+                    Scheme::Hysteria2,
+                    "pw",
+                    &[("servername", "cdn.example.com")],
+                ),
+            ),
+        ];
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            "h.example.com".to_string(),
+            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
+        );
+
+        let (plain, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
+        let (pinned, _) = generate(&rows, &pins, false).unwrap();
+        let plain: serde_norway::Value = serde_norway::from_str(&plain).unwrap();
+        let pinned: serde_norway::Value = serde_norway::from_str(&pinned).unwrap();
+        let plain = plain["proxies"].as_sequence().unwrap();
+        let pinned = pinned["proxies"].as_sequence().unwrap();
+        for (index, proxy) in plain.iter().enumerate() {
+            assert!(proxy.get("sni").is_none(), "row {index} renders no sni");
+        }
+        for (index, proxy) in pinned.iter().enumerate() {
+            assert_eq!(
+                proxy["sni"].as_str(),
+                Some("cdn.example.com"),
+                "row {index}"
+            );
+        }
+    }
+
+    /// A row whose host already is an IP literal loses nothing when
+    /// pinned, and an IP is not a valid TLS server name: such an entry is
+    /// serialized exactly as it was.
+    #[test]
+    fn pinning_an_ip_literal_host_does_not_invent_a_server_name() {
+        let mut row = row_from_entry(1, entry(Scheme::Trojan, "pass", &[]));
+        row.host = "203.0.113.10".into();
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("203.0.113.10".to_string(), "203.0.113.10".parse().unwrap());
+
+        let (yaml, _) = generate(&[row], &pins, false).unwrap();
+        let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+        let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
+        assert_eq!(proxy["server"].as_str(), Some("203.0.113.10"));
+        assert!(proxy.get("sni").is_none(), "{yaml}");
+    }
+
+    /// `ipv6` rides into the rendered config: meow-rs 0.22.0 made the key
+    /// effective end-to-end, so an omitted one would silently mean
+    /// "IPv4 only" no matter what `[meow].ipv6` says.
+    #[test]
+    fn ipv6_flag_is_rendered_explicitly() {
+        let rows = vec![row_from_entry(7, entry(Scheme::Vless, "uuid-7", &[]))];
+        let pins = std::collections::HashMap::new();
+
+        let (off, _) = generate(&rows, &pins, false).unwrap();
+        let (on, _) = generate(&rows, &pins, true).unwrap();
+        let off: serde_norway::Value = serde_norway::from_str(&off).unwrap();
+        let on: serde_norway::Value = serde_norway::from_str(&on).unwrap();
+
+        assert_eq!(off["ipv6"].as_bool(), Some(false));
+        assert_eq!(on["ipv6"].as_bool(), Some(true));
     }
 }

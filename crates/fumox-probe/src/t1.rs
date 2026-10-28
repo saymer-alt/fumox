@@ -27,26 +27,76 @@ impl CheckKind {
 
 /// Decide the T1 flavour from the scheme and its recognized parameters.
 ///
-/// trojan/naive always negotiate TLS; vless/vmess do so only when their
-/// `security` parameter is `tls` or `reality`; ss/socks5 are plain TCP.
-/// QUIC schemes (hysteria2) and the unprobeable ones (tuic, mieru) never
-/// reach T1 — they are filtered out by the candidate query — so the
+/// trojan/naive always negotiate TLS; vless/vmess do so when their own
+/// parameters say they are a TLS endpoint, in either of the two vocabularies
+/// that reach `proxies.params` (see [`params_enable_tls`]); ss/socks5 are
+/// plain TCP. QUIC schemes (hysteria2) and the unprobeable ones (tuic, mieru)
+/// never reach T1, they are filtered out by the candidate query, so the
 /// fallback branch is defensive only.
 pub fn check_kind(scheme: Scheme, params_json: Option<&str>) -> CheckKind {
     match scheme {
         Scheme::Trojan | Scheme::Naive => CheckKind::Tls,
-        Scheme::Ss | Scheme::Socks5 => CheckKind::Tcp,
         Scheme::Vless | Scheme::Vmess => {
-            let security = params_json
-                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-                .and_then(|value| value.get("security")?.as_str().map(str::to_string));
-            match security.as_deref() {
-                Some("tls") | Some("reality") => CheckKind::Tls,
-                _ => CheckKind::Tcp,
+            if params_enable_tls(params_json) {
+                CheckKind::Tls
+            } else {
+                CheckKind::Tcp
             }
         }
+        // Snell is a plain TCP protocol (its obfs is a wrapper the tunnel
+        // itself speaks, not a handshake T1 could validate), so a connect
+        // is the honest reachability signal.
+        Scheme::Ss | Scheme::Socks5 | Scheme::Snell => CheckKind::Tcp,
         Scheme::Hysteria2 | Scheme::Tuic | Scheme::Mieru => CheckKind::Tcp,
+        // AnyTLS speaks TLS to its server, so a handshake is a stronger
+        // liveness signal than a bare connect and matches trojan's tier.
+        Scheme::AnyTls => CheckKind::Tls,
     }
+}
+
+/// Whether a vless/vmess entry's stored parameters put it behind TLS.
+///
+/// Both producer vocabularies have to be understood, exactly as the T2
+/// mapping in `fumox_core::formats::clash` does:
+/// `security=tls|reality` for URI links, and the mihomo spelling Clash YAML
+/// inputs use, `tls: true` (`tls: "tls"` in the vmess JSON base64 blob).
+/// Deciding on `security` alone checked every Clash-sourced node as plain
+/// TCP, so a vless/vmess with a broken TLS listener passed T1 and was
+/// served while the identical `vless://` spelling failed it.
+///
+/// Read case-insensitively on both sides, like `ProxyEntry::param_ignore_case`,
+/// and a non-string JSON scalar (the stored params are strings today) still
+/// counts through its textual form.
+fn params_enable_tls(params_json: Option<&str>) -> bool {
+    let Some(params) = params_json.and_then(|text| {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()
+    }) else {
+        return false;
+    };
+    let param = |key: &str| param_text(&params, key);
+    if param("security")
+        .is_some_and(|v| v.eq_ignore_ascii_case("tls") || v.eq_ignore_ascii_case("reality"))
+    {
+        return true;
+    }
+    // `tls: "tls"` (vmess JSON) and `tls: true` → `"true"` (Clash YAML).
+    param("tls").is_some_and(|v| {
+        let v = v.to_ascii_lowercase();
+        v == "tls" || matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+/// Trimmed textual form of a JSON object member, looked up case-insensitively.
+fn param_text(params: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    let value = params
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| match v {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })?;
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 /// TLS connector with certificate verification disabled.
@@ -136,7 +186,7 @@ pub struct Target<'a> {
 /// vet_probe_host_addrs` returned for `target.host` moments ago. Connecting
 /// to those exact IPs (instead of re-resolving the hostname) closes the
 /// DNS-rebinding window between vet and dial, and sidesteps the IPv6
-/// `host:port` formatting trap entirely — a `SocketAddr` needs no brackets.
+/// `host:port` formatting trap entirely, a `SocketAddr` needs no brackets.
 pub async fn run(
     target: &Target<'_>,
     connect_timeout: Duration,
@@ -144,10 +194,9 @@ pub async fn run(
 ) -> Result<Duration, String> {
     let started = Instant::now();
 
-    // Try each vetted address in order; the first successful connect wins.
-    // The timeout covers one dial attempt, mirroring the previous single-
-    // address behaviour; a multi-address host costs at most
-    // `vetted.len() × connect_timeout`.
+    // Each vetted address gets its own connect_timeout, so the worst case
+    // stays `4 × connect_timeout` + the TLS handshake; the list is capped
+    // at ssrf::MAX_VETTED_ADDRESSES.
     let mut stream = None;
     let mut last_error = "no vetted address to connect to".to_string();
     for ip in target.vetted {
@@ -196,6 +245,16 @@ mod tests {
         assert_eq!(check_kind(Scheme::Naive, None), CheckKind::Tls);
         assert_eq!(check_kind(Scheme::Ss, None), CheckKind::Tcp);
         assert_eq!(check_kind(Scheme::Socks5, None), CheckKind::Tcp);
+        // Snell's obfs is spoken inside the tunnel, not a handshake T1
+        // could validate: connect-only, the T2 tunnel is the verification.
+        assert_eq!(check_kind(Scheme::Snell, None), CheckKind::Tcp);
+        // AnyTLS speaks TLS; the verdict ignores params (there is no
+        // plain-TCP spelling of the protocol to fall back to).
+        assert_eq!(check_kind(Scheme::AnyTls, None), CheckKind::Tls);
+        assert_eq!(
+            check_kind(Scheme::AnyTls, params(r#"{"tls":"false"}"#)),
+            CheckKind::Tls
+        );
         assert_eq!(
             check_kind(Scheme::Vless, params(r#"{"security":"reality"}"#)),
             CheckKind::Tls
@@ -209,6 +268,36 @@ mod tests {
             CheckKind::Tcp
         );
         assert_eq!(check_kind(Scheme::Vless, None), CheckKind::Tcp);
+        // Clash-sourced spells, the same params the T2 mapping reads
+        // (`formats::clash`): boolean `tls: true` plus `servername`.
+        assert_eq!(
+            check_kind(
+                Scheme::Vless,
+                params(r#"{"tls":"true","servername":"s.example.com"}"#)
+            ),
+            CheckKind::Tls
+        );
+        assert_eq!(
+            check_kind(Scheme::Vmess, params(r#"{"tls":"true"}"#)),
+            CheckKind::Tls
+        );
+        // vmess JSON spells it `tls: "tls"`.
+        assert_eq!(
+            check_kind(
+                Scheme::Vmess,
+                params(r#"{"tls":"tls","sni":"s.example.com"}"#)
+            ),
+            CheckKind::Tls
+        );
+        // The negative Clash spelling stays plain TCP.
+        assert_eq!(
+            check_kind(Scheme::Vless, params(r#"{"tls":"false","network":"ws"}"#)),
+            CheckKind::Tcp
+        );
+        assert_eq!(
+            check_kind(Scheme::Vless, params(r#"{"TLS":"on"}"#)),
+            CheckKind::Tls
+        );
         assert_eq!(
             check_kind(Scheme::Vmess, params(r#"{"security":"tls"}"#)),
             CheckKind::Tls
@@ -219,6 +308,45 @@ mod tests {
         );
         // Corrupt JSON degrades to TCP instead of failing the check.
         assert_eq!(check_kind(Scheme::Vless, params("{oops")), CheckKind::Tcp);
+    }
+
+    /// The verdict must not depend on which feed spelling a node arrived
+    /// in: the same TLS proxy parsed from a Clash YAML source and from a
+    /// `vless://` URI has to be checked the same way, and T2's mapping of
+    /// the very same two entries has to negotiate TLS for both, otherwise
+    /// the daemon would tunnel-test a node it considered plain TCP.
+    #[test]
+    fn clash_and_uri_spellings_agree_on_tls() {
+        let yaml = "proxies:\n  - name: clash-tls\n    type: vless\n    server: h.example.com\n    port: 443\n    uuid: uuid-1\n    network: ws\n    tls: true\n    servername: s.example.com\n";
+        let parsed = fumox_core::parsers::clash::parse_payload(yaml).unwrap();
+        let clash_json = serde_json::to_string(&parsed.entries[0].known_params_json()).unwrap();
+        assert!(
+            clash_json.contains(r#""tls""#) && !clash_json.contains(r#""security""#),
+            "the Clash producer must land in params as `tls`, got {clash_json}"
+        );
+
+        let uri = match fumox_core::parsers::parse_line(
+            "vless://uuid-1@h.example.com:443?security=tls&sni=s.example.com&type=ws#Name",
+        ) {
+            fumox_core::parsers::LineOutcome::Parsed(entry) => entry,
+            other => panic!("expected a parsed entry, got {other:?}"),
+        };
+        let uri_json = serde_json::to_string(&uri.known_params_json()).unwrap();
+
+        assert_eq!(check_kind(Scheme::Vless, Some(&clash_json)), CheckKind::Tls);
+        assert_eq!(check_kind(Scheme::Vless, Some(&uri_json)), CheckKind::Tls);
+
+        // T2 builds its proxy from the same two entries, through the shared
+        // core mapping the subscriptions are served with.
+        for (spelling, entry) in [("clash", &parsed.entries[0]), ("uri", &uri)] {
+            let value = fumox_core::formats::clash::entry_to_clash(entry)
+                .expect("vless has a mihomo counterpart");
+            assert_eq!(
+                value["tls"].as_bool(),
+                Some(true),
+                "{spelling} row: T2 must agree that this is a TLS endpoint"
+            );
+        }
     }
 
     #[tokio::test]
@@ -240,7 +368,7 @@ mod tests {
         assert!(result.is_ok(), "expected a successful connect: {result:?}");
     }
 
-    /// An IPv6-literal host connects fine when dialed as a `SocketAddr` —
+    /// An IPv6-literal host connects fine when dialed as a `SocketAddr` ,
     /// the previous `format!("{host}:{port}")` produced an unparseable
     /// `2001:db8::1:443` string and every IPv6 proxy failed T1.
     #[tokio::test]

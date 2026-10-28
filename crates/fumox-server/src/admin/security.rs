@@ -3,7 +3,7 @@
 //! Content-Security-Policy. The panel renders
 //! with server-side askama escaping and ships its script (htmx) and the
 //! inline bootstrap scripts/styles from itself, so `'unsafe-inline'` for
-//! script/style is the current floor — no external origins are allowed.
+//! script/style is the current floor, no external origins are allowed.
 
 use axum::extract::Request;
 use axum::http::{HeaderValue, header};
@@ -35,7 +35,16 @@ pub async fn headers(req: Request, next: Next) -> Response {
     );
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        // `same-origin`, not `no-referrer`: per Fetch, a request whose
+        // referrer policy resolves to `no-referrer` is stamped with
+        // `Origin: null`, and the panel's own cross-site gate
+        // (`admin::auth::cross_site_context`) rejects that before auth.
+        // `no-referrer` on the login page therefore locked the operator
+        // out of every browser: the form's own navigation POST came back
+        // `403 err.cross_site`. `same-origin` still withholds the panel
+        // URL from third-party origins, which is the leak this header
+        // exists to stop.
+        HeaderValue::from_static("same-origin"),
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
